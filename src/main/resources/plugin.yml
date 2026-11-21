@@ -1,0 +1,20 @@
+name: ALSuperDragon
+version: '${version}'
+main: al.dragon.ALDragon
+api-version: '26.1.2'
+description: 'AL超级末影龙：强化末影龙战斗，支持复活龙蛋掉落、保底机制和可配置技能。'
+commands:
+  alsuperdragon:
+    description: AL超级末影龙管理员指令
+    usage: '/<command> reload | summon <血量倍率> | resetpity [末地世界名]'
+    permission: alsuperdragon.reload;alsuperdragon.summon;alsuperdragon.resetpity
+permissions:
+  alsuperdragon.reload:
+    description: 允许重载 AL超级末影龙
+    default: op
+  alsuperdragon.summon:
+    description: 允许在末地召唤指定倍率的末影龙
+    default: op
+  alsuperdragon.resetpity:
+    description: 允许清零末地世界的龙蛋保底次数
+    default: op
