@@ -4,6 +4,7 @@ import java.io.File;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -28,6 +29,7 @@ import org.bukkit.World;
 import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
 import org.bukkit.boss.DragonBattle;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
@@ -35,6 +37,7 @@ import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.ComplexEntityPart;
 import org.bukkit.entity.EnderDragon;
+import org.bukkit.entity.EnderCrystal;
 import org.bukkit.entity.Enderman;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
@@ -60,10 +63,12 @@ public final class ALDragon extends JavaPlugin implements Listener {
     private final NamespacedKey lastDamageKey = storedKey("last_damage_at");
     private final NamespacedKey missesKey = storedKey("egg_misses");
     private final Set<UUID> eggDecisions = new HashSet<>();
-    private final Map<UUID, Double> summonMultipliers = new HashMap<>();
+    private final Map<UUID, PendingSummon> pendingSummons = new HashMap<>();
     private Settings settings;
     private DragonSkills skills;
     private Language language;
+
+    private record PendingSummon(double multiplier, List<EnderCrystal> crystals, Player requester) {}
 
     static NamespacedKey storedKey(String key) {
         return NamespacedKey.fromString("aldragon:" + key);
@@ -137,11 +142,40 @@ public final class ALDragon extends JavaPlugin implements Listener {
         World world = player.getWorld();
         DragonBattle battle = world.getEnderDragonBattle();
         if (battle.getEnderDragon() != null || !battle.hasBeenPreviouslyKilled()
-            || battle.getRespawnPhase() != DragonBattle.RespawnPhase.NONE || !battle.initiateRespawn(List.of())) {
+            || battle.getRespawnPhase() != DragonBattle.RespawnPhase.NONE) {
             sender.sendMessage(language.message("summon-unavailable", NamedTextColor.RED));
             return true;
         }
-        summonMultipliers.put(world.getUID(), multiplier);
+        Location portal = battle.getEndPortalLocation();
+        if (portal == null) {
+            battle.generateEndPortal(true);
+            portal = battle.getEndPortalLocation();
+        }
+        if (portal == null) {
+            sender.sendMessage(language.message("summon-portal-missing", NamedTextColor.RED));
+            return true;
+        }
+        List<EnderCrystal> crystals = new ArrayList<>(4);
+        boolean started = false;
+        try {
+            for (BlockFace side : List.of(BlockFace.NORTH, BlockFace.EAST, BlockFace.SOUTH, BlockFace.WEST)) {
+                Location spot = portal.getBlock().getRelative(side, 3).getLocation().add(.5, 1, .5);
+                EnderCrystal crystal = world.spawn(spot, EnderCrystal.class, spawned -> spawned.setShowingBottom(false));
+                crystals.add(crystal);
+                if (!crystal.isValid()) break;
+            }
+            started = crystals.size() == 4 && crystals.stream().allMatch(EnderCrystal::isValid)
+                && battle.initiateRespawn(crystals);
+        } catch (RuntimeException exception) {
+            getLogger().log(Level.WARNING, "Could not prepare dragon respawn in " + world.getName(), exception);
+        } finally {
+            if (!started) crystals.forEach(EnderCrystal::remove);
+        }
+        if (!started) {
+            sender.sendMessage(language.message("summon-start-failed", NamedTextColor.RED));
+            return true;
+        }
+        pendingSummons.put(world.getUID(), new PendingSummon(multiplier, crystals, player));
         sender.sendMessage(Component.text(language.text("summon-started")
             .replace("{health}", Double.toString(multiplier)).replace("{damage}", Double.toString(multiplier / 2)), NamedTextColor.GREEN));
         return true;
@@ -195,7 +229,15 @@ public final class ALDragon extends JavaPlugin implements Listener {
             if (battle == null) continue;
             EnderDragon dragon = battle.getEnderDragon();
             if (dragon == null || DragonRushCast.isDecoy(dragon)) {
-                if (battle.getRespawnPhase() == DragonBattle.RespawnPhase.NONE) summonMultipliers.remove(world.getUID());
+                if (battle.getRespawnPhase() == DragonBattle.RespawnPhase.NONE) {
+                    PendingSummon pending = pendingSummons.remove(world.getUID());
+                    if (pending != null) {
+                        pending.crystals().forEach(EnderCrystal::remove);
+                        if (pending.requester().isOnline()) {
+                            pending.requester().sendMessage(language.message("summon-interrupted", NamedTextColor.RED));
+                        }
+                    }
+                }
                 continue;
             }
             boolean alive = !dragon.isDead() && dragon.getHealth() > 0 && dragon.getPhase() != EnderDragon.Phase.DYING;
@@ -226,7 +268,8 @@ public final class ALDragon extends JavaPlugin implements Listener {
             data.set(lastDamageKey, PersistentDataType.LONG, System.currentTimeMillis());
         }
         if (data.has(healthKey, PersistentDataType.DOUBLE)) return;
-        Double forced = summonMultipliers.remove(dragon.getWorld().getUID());
+        PendingSummon pending = pendingSummons.remove(dragon.getWorld().getUID());
+        Double forced = pending == null ? null : pending.multiplier();
         AttributeInstance health = dragon.getAttribute(Attribute.MAX_HEALTH);
         double actualMultiplier = 1;
         if (health != null) {

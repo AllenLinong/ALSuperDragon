@@ -42,6 +42,7 @@ import org.bukkit.util.Vector;
 
 final class DragonSkills {
     private static final int STEP = 1;
+    private static final int CAST_GAP_TICKS = 100;
     private static final int REGULAR_RECOVERY_TICKS = 40;
     private static final double RANGED_CAST_RANGE = 64;
     private static final NamespacedKey RUSH_REACHED = ALDragon.storedKey("rush_reached");
@@ -153,11 +154,19 @@ final class DragonSkills {
                 && horizontalDistanceSquared(player.getLocation(), center) <= tuning.arenaRadius() * tuning.arenaRadius()) players.add(player);
         }
         if (players.isEmpty()) {
-            Fight old = fights.remove(id);
-            if (old != null) old.cleanup();
+            Fight idle = fights.get(id);
+            if (idle != null) {
+                idle.age += STEP;
+                if (!idle.idle) {
+                    if (idle.hasActiveCast()) recover(idle, settings.majorRecoveryTicks());
+                    idle.cleanup();
+                    idle.idle = true;
+                }
+            }
             return;
         }
         Fight fight = fights.computeIfAbsent(id, ignored -> new Fight(dragon, interval));
+        fight.idle = false;
         fight.age += STEP;
         DragonParticles particles = new DragonParticles(dragon.getWorld().getPlayers());
         if (settings.trail()) particles.trail(dragon.getLocation().add(0, 2.5, 0));
@@ -191,28 +200,26 @@ final class DragonSkills {
         }
         if (fight.podiumActive) {
             fight.podiumActive = false;
-            recover(fight);
+            recover(fight, settings.majorRecoveryTicks());
         }
-        if (fight.age < fight.nextMajor) return;
         if (fight.rush != null) {
             if (fight.rush.tick(players)) {
                 fight.rush = null;
-                recover(fight);
+                recover(fight, settings.majorRecoveryTicks());
             }
             return;
         }
         if (fight.bite != null) {
             if (fight.bite.tick(players)) {
                 fight.bite = null;
-                recoverRegular(fight);
+                recover(fight, REGULAR_RECOVERY_TICKS);
             }
             return;
         }
         if (fight.trackingLaser != null) {
             if (fight.trackingLaser.tick(players, particles)) {
-                fight.trackingLaser.finish();
                 fight.trackingLaser = null;
-                recoverRegular(fight);
+                recover(fight, REGULAR_RECOVERY_TICKS);
             }
             return;
         }
@@ -220,22 +227,18 @@ final class DragonSkills {
             CombatPhase previous = fight.phase;
             runDatapackPhase(dragon, fight, center, particles);
             if (fight.phase == CombatPhase.NONE) {
-                if (previous == CombatPhase.EXTRA_FIREBALL) recoverRegular(fight);
-                else recover(fight);
+                recover(fight, previous == CombatPhase.EXTRA_FIREBALL ? REGULAR_RECOVERY_TICKS : settings.majorRecoveryTicks());
             }
             return;
         }
-        if (fight.cast != null && fight.cast.tick(dragon, players, settings, fight.breathClouds)) {
-            boolean finale = fight.cast.attack == Attack.FINALE;
-            fight.cast = null;
-            if (finale) {
-                recover(fight);
-                return;
+        if (fight.cast != null) {
+            if (fight.cast.tick(dragon, players, settings, fight.breathClouds)) {
+                recover(fight, fight.cast.attack == Attack.FINALE ? settings.majorRecoveryTicks() : REGULAR_RECOVERY_TICKS);
+                fight.cast = null;
             }
-            recoverRegular(fight);
+            return;
         }
-        fight.cooldown = Math.max(0, fight.cooldown - STEP);
-        if (fight.cast != null) return;
+        if (fight.age < fight.nextCast) return;
 
         if (crystalPending && dragon.getWorld().isChunkLoaded(center.getBlockX() >> 4, center.getBlockZ() >> 4)) {
             Location eggSpot = center.getBlock().getLocation().add(.5, 4, .5);
@@ -247,6 +250,7 @@ final class DragonSkills {
                 data.set(PODIUM_CRYSTAL_USED, PersistentDataType.BYTE, (byte) 1);
                 podiumCrystals.put(id, chargeCrystal);
                 fight.podiumActive = true;
+                beginCast(fight);
                 announce(players, "podium-wave-warning", NamedTextColor.RED);
                 if (tuning.titleTicks() > 0) {
                     String seconds = Integer.toString((charge.fuseTicks() + 19) / 20);
@@ -261,7 +265,7 @@ final class DragonSkills {
         if (rushPending) {
             fight.rush = new DragonRushCast(dragon, players, language, rush, tuning, rushCasts);
             data.set(RUSH_CASTS, PersistentDataType.INTEGER, rushCasts + 1);
-            fight.cooldown = interval;
+            beginCast(fight);
             return;
         }
         if (remaining <= tuning.finaleHp() && settings.finale() >= 0 && !dragon.getPersistentDataContainer().has(finaleKey)) {
@@ -269,26 +273,28 @@ final class DragonSkills {
             for (Player player : players) player.sendActionBar(language.message("finale-warning", NamedTextColor.GOLD));
             dragon.setPhase(EnderDragon.Phase.FLY_TO_PORTAL);
             fight.cast = new Cast(Attack.FINALE, dragon.getLocation(), center.clone().add(0.5, 1, 0.5));
-            fight.cooldown = interval;
+            beginCast(fight);
             return;
         }
-        if (startDatapackPhase(dragon, fight, players)) return;
-        if (fight.age < fight.nextRegular) return;
+        if (fight.age >= fight.nextRegularCast && startDatapackPhase(dragon, fight, players, remaining)) {
+            beginRegularCast(fight, interval);
+            return;
+        }
         int roarCasts = data.getOrDefault(ROAR_CASTS, PersistentDataType.INTEGER, 0);
         int nextRoarMark = (roarCasts / 2 + 1) * 2;
         if (settings.extra().roarEnabled() && nextRoarMark <= roarReached && fight.age >= fight.nextRoar) {
             roar(dragon.getLocation(), players, settings.extra().roarRange());
             data.set(ROAR_CASTS, PersistentDataType.INTEGER, nextRoarMark);
             fight.nextRoar = fight.age + Math.max(20, tuning.titleTicks() + tuning.titleFadeTicks());
-            recoverRegular(fight);
+            beginCast(fight);
             return;
         }
-        if (settings.fireball() >= 0) {
-            replaceVanillaFireballs(fight, particles);
-            if (fight.phase != CombatPhase.NONE) return;
-        }
         if (startMinorSkill(fight, players, remaining)) return;
-        if (fight.cooldown > 0) return;
+        if (fight.age < fight.nextRegularCast) return;
+        if (settings.fireball() >= 0 && replaceVanillaFireball(fight, particles)) {
+            beginRegularCast(fight, interval);
+            return;
+        }
         List<Attack> options = new ArrayList<>(4);
         Location origin = dragon.getLocation().add(0, 2, 0);
         var nearby = players.stream().filter(player -> inRange(origin, player.getEyeLocation(), RANGED_CAST_RANGE)).toList();
@@ -299,10 +305,10 @@ final class DragonSkills {
         if (!visible.isEmpty() && remaining <= tuning.fireballHp() && settings.fireball() >= 0) options.add(Attack.FIREBALL);
         if (!visible.isEmpty() && remaining <= tuning.laserHp() && settings.laser() >= 0) options.add(Attack.LASER);
         if (options.isEmpty()) {
-            fight.cooldown = 20;
+            fight.nextRegularCast = fight.age + 20;
             return;
         }
-        fight.cooldown = interval;
+        beginRegularCast(fight, interval);
         var random = ThreadLocalRandom.current();
         Attack attack = options.contains(Attack.LASER) && !fight.usedLaser ? Attack.LASER
             : options.contains(Attack.FIREBALL) && !fight.usedFireball ? Attack.FIREBALL
@@ -329,7 +335,6 @@ final class DragonSkills {
     }
 
     private boolean startMinorSkill(Fight fight, List<Player> players, double health) {
-        if (fight.age < fight.nextMinor) return false;
         var extra = settings.extra();
         MinorSkill selected = null;
         List<Player> targets = List.of();
@@ -350,10 +355,7 @@ final class DragonSkills {
                         player.getEyeLocation(), extra.trackingLaser().range())).toList();
                     default -> players.stream().filter(player -> DragonParticles.loaded(player.getLocation())).toList();
                 };
-                if (candidates.isEmpty()) {
-                    fight.minorReady.put(minor, fight.age + 20);
-                    continue;
-                }
+                if (candidates.isEmpty()) continue;
                 selected = minor;
                 targets = candidates;
                 earliest = readyAt;
@@ -363,7 +365,7 @@ final class DragonSkills {
         Player target = targets.get(ThreadLocalRandom.current().nextInt(targets.size()));
         for (Player player : players) player.sendActionBar(language.message(selected.warning, NamedTextColor.LIGHT_PURPLE));
         fight.minorReady.put(selected, fight.age + selected.settings(extra).cooldownTicks());
-        fight.nextMinor = fight.age + 100;
+        beginCast(fight);
         if (selected == MinorSkill.SKY_BITE) {
             fight.bite = new SkyBite(fight.dragon, target, language, extra, settings.tuning().damageScale());
         } else if (selected == MinorSkill.TRACKING_LASER) {
@@ -437,12 +439,17 @@ final class DragonSkills {
         fight.phantomsExpire = fight.age + settings.tuning().phantomSeconds() * 20;
     }
 
-    private void recover(Fight fight) {
-        fight.nextMajor = fight.age + settings.majorRecoveryTicks();
+    private static void beginCast(Fight fight) {
+        fight.nextCast = fight.age + CAST_GAP_TICKS;
     }
 
-    private static void recoverRegular(Fight fight) {
-        fight.nextRegular = fight.age + REGULAR_RECOVERY_TICKS;
+    private static void beginRegularCast(Fight fight, int interval) {
+        beginCast(fight);
+        fight.nextRegularCast = fight.age + interval;
+    }
+
+    private static void recover(Fight fight, int ticks) {
+        fight.nextCast = Math.max(fight.nextCast, fight.age + ticks);
     }
 
     private static boolean inRange(Location from, Location to, double range) {
@@ -462,20 +469,11 @@ final class DragonSkills {
         return from.getWorld().rayTraceBlocks(from, direction, length, FluidCollisionMode.NEVER, true) == null;
     }
 
-    private boolean startDatapackPhase(EnderDragon dragon, Fight fight, List<Player> players) {
-        if (fight.phase != CombatPhase.NONE) return false;
-        var maxHealth = dragon.getAttribute(Attribute.MAX_HEALTH);
-        if (maxHealth == null) return false;
-        double health = dragon.getHealth() / maxHealth.getValue();
+    private boolean startDatapackPhase(EnderDragon dragon, Fight fight, List<Player> players, double health) {
         if (!fight.halfPhase && health <= settings.tuning().fireballHp() && settings.fireball() >= 0) {
             fight.halfPhase = true;
             fight.phase = CombatPhase.ULTRA_FIREBALL;
             fight.phaseTick = 0;
-            dragon.setInvulnerable(true);
-            fight.savedAi = dragon.hasAI();
-            fight.savedSilent = dragon.isSilent();
-            dragon.setAI(false);
-            dragon.setSilent(true);
             announce(players, "ultra-fireball-phase", NamedTextColor.LIGHT_PURPLE);
             dragon.getWorld().playSound(dragon.getLocation(), Sound.BLOCK_ENDER_CHEST_OPEN, 6, .6f);
             return true;
@@ -484,11 +482,10 @@ final class DragonSkills {
             fight.quarterPhase = true;
             fight.phase = CombatPhase.LASER;
             fight.phaseTick = 0;
-            dragon.setInvulnerable(true);
             announce(players, "laser-phase", NamedTextColor.DARK_PURPLE);
             return true;
         }
-        if (fight.halfPhase && settings.dive() >= 0 && fight.age >= fight.nextRegular && fight.age % 20 == STEP
+        if (fight.halfPhase && settings.dive() >= 0 && fight.age % 20 == STEP
             && ThreadLocalRandom.current().nextDouble() < .06
             && players.stream().anyMatch(player -> horizontalDistanceSquared(player.getLocation(), dragon.getLocation()) <= 40 * 40)) {
             fight.phase = CombatPhase.DIVE;
@@ -515,10 +512,6 @@ final class DragonSkills {
     private void ultraFireball(EnderDragon dragon, Fight fight, DragonParticles particles) {
         int tick = fight.phaseTick;
         if (tick == 20) {
-            dragon.setAI(fight.savedAi);
-            dragon.setSilent(fight.savedSilent);
-            dragon.setInvulnerable(false);
-            dragon.setPhase(EnderDragon.Phase.CIRCLING);
             particles.phaseBurst(dragon.getLocation().add(0, 1.5, 0));
             dragon.getWorld().playSound(dragon.getLocation(), Sound.ENTITY_ENDER_DRAGON_GROWL, 7, .8f);
         }
@@ -529,8 +522,6 @@ final class DragonSkills {
             launchUltra(fight, particles, origin, offsetShot, true);
         }
         if (tick >= 218) {
-            dragon.setInvulnerable(false);
-            dragon.setPhase(EnderDragon.Phase.CIRCLING);
             fight.phase = CombatPhase.NONE;
             fight.phaseTick = 0;
         }
@@ -547,19 +538,20 @@ final class DragonSkills {
         }
     }
 
-    private void replaceVanillaFireballs(Fight fight, DragonParticles particles) {
+    private boolean replaceVanillaFireball(Fight fight, DragonParticles particles) {
         Location origin = fight.dragon.getLocation();
         for (DragonFireball fireball : origin.getWorld().getNearbyEntitiesByType(DragonFireball.class, origin, 32)) {
             if (!fight.dragon.equals(fireball.getShooter()) || fireball.getTicksLived() > 2) continue;
             fireball.remove();
             launchUltra(fight, particles, origin.clone(), false, false);
             var maxHealth = fight.dragon.getAttribute(Attribute.MAX_HEALTH);
-            if (fight.phase == CombatPhase.NONE && fight.cast == null
-                && maxHealth != null && fight.dragon.getHealth() < maxHealth.getValue()) {
+            if (maxHealth != null && fight.dragon.getHealth() < maxHealth.getValue()) {
                 fight.phase = CombatPhase.EXTRA_FIREBALL;
                 fight.phaseTick = -1;
             }
+            return true;
         }
+        return false;
     }
 
     private void launchUltra(Fight fight, DragonParticles particles, Location origin, boolean offsetShot, boolean immediate) {
@@ -588,7 +580,7 @@ final class DragonSkills {
         }
         if (tick == 41) {
             fight.laserPose = dragon.getLocation();
-            dragon.setPhase(EnderDragon.Phase.HOVER);
+            dragon.setPhase(EnderDragon.Phase.CIRCLING);
         }
         if (tick >= 200 && tick <= 240 && tick % 10 == 0) {
             dragon.getWorld().playSound(dragon.getLocation(), Sound.ENTITY_ILLUSIONER_PREPARE_BLINDNESS, 8, 1.6f);
@@ -614,7 +606,6 @@ final class DragonSkills {
         if (tick >= 250 && tick <= 281) pose.setPitch(90);
         if (tick >= 251 && tick <= 575) {
             if (tick == 251) {
-                dragon.setInvulnerable(false);
                 dragon.getWorld().playSound(dragon.getLocation(), Sound.ENTITY_ENDER_DRAGON_GROWL, 4, .5f);
             }
             dragon.setRotation(pose.getYaw(), pose.getPitch());
@@ -626,7 +617,6 @@ final class DragonSkills {
             pose.setPitch(pose.getPitch() + (float) tilt);
         }
         if (tick >= 575) {
-            dragon.setInvulnerable(false);
             dragon.setPhase(EnderDragon.Phase.CIRCLING);
             fight.phase = CombatPhase.NONE;
             fight.phaseTick = 0;
@@ -707,7 +697,6 @@ final class DragonSkills {
             }
         }
         if ((fight.diveCount <= 1 && tick == 210) || tick >= 800) {
-            dragon.setInvulnerable(false);
             dragon.setPhase(EnderDragon.Phase.CIRCLING);
             fight.phase = CombatPhase.NONE;
             fight.phaseTick = 0;
@@ -912,10 +901,10 @@ final class DragonSkills {
 
     private final class Fight {
         private final EnderDragon dragon;
-        private int cooldown;
+        private int nextRegularCast;
         private int nextRoar;
-        private int nextMajor;
-        private int nextRegular;
+        private int nextCast;
+        private boolean idle;
         private boolean podiumActive;
         private boolean usedFireball;
         private boolean usedLaser;
@@ -935,19 +924,16 @@ final class DragonSkills {
         private CombatPhase phase = CombatPhase.NONE;
         private int phaseTick;
         private boolean halfPhase;
-        private boolean savedAi;
-        private boolean savedSilent;
         private boolean quarterPhase;
         private int diveCount;
         private DragonRushCast rush;
         private SkyBite bite;
         private TrackingLaser trackingLaser;
         private final Map<MinorSkill, Integer> minorReady = new EnumMap<>(MinorSkill.class);
-        private int nextMinor;
 
-        private Fight(EnderDragon dragon, int cooldown) {
+        private Fight(EnderDragon dragon, int interval) {
             this.dragon = dragon;
-            this.cooldown = cooldown;
+            nextRegularCast = interval;
         }
 
         private void expirePhantoms() {
@@ -960,22 +946,31 @@ final class DragonSkills {
             phantoms.clear();
         }
 
+        private boolean hasActiveCast() {
+            return podiumActive || rush != null || bite != null || trackingLaser != null || phase != CombatPhase.NONE || cast != null;
+        }
+
         private void cleanup() {
+            if (bite != null) bite.cancel();
+            if ((phase == CombatPhase.DIVE || phase == CombatPhase.LASER) && dragon.isValid() && !dragon.isDead()
+                && dragon.getPhase() != EnderDragon.Phase.DYING) {
+                dragon.setPhase(EnderDragon.Phase.CIRCLING);
+            }
             if (rush != null) rush.cleanup();
-            if (bite != null) bite.finish(false);
-            if (trackingLaser != null) trackingLaser.finish();
+            rush = null;
+            bite = null;
+            trackingLaser = null;
+            cast = null;
+            phase = CombatPhase.NONE;
+            phaseTick = 0;
+            laserPose = null;
+            fireballs.clear();
+            waves.clear();
+            crystalReaction = 0;
             breathClouds.forEach(AreaEffectCloud::remove);
             breathClouds.clear();
             mirrorDragons.forEach(MirrorDragon::remove);
             mirrorDragons.clear();
-            if (phase == CombatPhase.ULTRA_FIREBALL && phaseTick < 20 && dragon.isValid()) {
-                dragon.setAI(savedAi);
-                dragon.setSilent(savedSilent);
-            }
-            if (phase != CombatPhase.NONE && dragon.isValid() && dragon.getPhase() != EnderDragon.Phase.DYING) {
-                dragon.setInvulnerable(false);
-                dragon.setPhase(EnderDragon.Phase.CIRCLING);
-            }
             clearPhantoms();
             stopMusic();
         }

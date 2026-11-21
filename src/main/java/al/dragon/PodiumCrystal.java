@@ -1,5 +1,6 @@
 package al.dragon;
 
+import java.util.ArrayDeque;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -27,9 +28,13 @@ final class PodiumCrystal {
     private final Set<UUID> passed = new HashSet<>();
     private final Set<UUID> blocked = new HashSet<>();
     private int remaining;
-    private int breathAge;
+    private final ArrayDeque<BreathBand> breathBands = new ArrayDeque<>();
+    private int waveAge;
+    private double expiredRadius = -1;
     private double waveRadius;
     private boolean detonated;
+
+    private record BreathBand(double outerRadius, int expiresAt) {}
 
     PodiumCrystal(Location eggSpot, Settings.PodiumCharge settings, Language language) {
         this.settings = settings;
@@ -68,18 +73,13 @@ final class PodiumCrystal {
             return true;
         }
         if (detonated) {
-            if (waveRadius < settings.radius()) {
-                advanceWave();
-                return false;
+            waveAge++;
+            if (waveRadius < settings.radius()) advanceWave();
+            while (!breathBands.isEmpty() && breathBands.peekFirst().expiresAt() <= waveAge) {
+                expiredRadius = breathBands.removeFirst().outerRadius();
             }
-            if (++breathAge > settings.breathTicks()) return true;
-            if (breathAge % 10 == 0) for (Player player : victims()) {
-                if (blocked.contains(player.getUniqueId())) continue;
-                player.spawnParticle(Particle.DRAGON_BREATH, player.getLocation().add(0, .6, 0), 7, 3, .35, 3, .025, 1f);
-                if (breathAge % 20 == 0 && settings.breathDamage() > 0) {
-                    player.damage(settings.breathDamage(), DamageSource.builder(DamageType.DRAGON_BREATH).build());
-                }
-            }
+            if (breathBands.isEmpty()) return true;
+            tickBreath();
             return false;
         }
         if (!isValid()) {
@@ -102,12 +102,14 @@ final class PodiumCrystal {
         world.spawnParticle(Particle.EXPLOSION_EMITTER, center, 1);
         world.playSound(center, Sound.ENTITY_GENERIC_EXPLODE, 5, .65f);
         advanceWave();
+        renderBreath();
         return false;
     }
 
     private void advanceWave() {
         double previous = waveRadius;
         waveRadius = Math.min(settings.radius(), waveRadius + settings.waveSpeed());
+        breathBands.addLast(new BreathBand(waveRadius, waveAge + settings.breathTicks()));
         DragonParticles particles = new DragonParticles(center.getWorld().getPlayers());
         renderRing(waveRadius, particles::groundWave);
         for (Player player : victims()) {
@@ -118,8 +120,30 @@ final class PodiumCrystal {
                 player.setHealth(player.getHealth() * .1);
                 player.sendActionBar(language.message("podium-wave-blocked", NamedTextColor.GREEN));
             } else if (settings.blastDamage() > 0) {
-                player.damage(settings.blastDamage(), DamageSource.builder(DamageType.EXPLOSION).build());
+                player.damage(settings.blastDamage(), DamageSource.builder(DamageType.DRAGON_BREATH).build());
             }
+        }
+    }
+
+    private void tickBreath() {
+        if (waveAge % 10 == 0) renderBreath();
+        if (waveAge % 20 != 0 || settings.breathDamage() <= 0) return;
+        for (Player player : victims()) {
+            if (blocked.contains(player.getUniqueId())) continue;
+            double distance = Math.sqrt(horizontalDistanceSquared(player.getLocation()));
+            if (distance <= expiredRadius || distance > waveRadius) continue;
+            player.damage(settings.breathDamage(), DamageSource.builder(DamageType.DRAGON_BREATH).build());
+        }
+    }
+
+    private void renderBreath() {
+        double innerRadius = Math.max(0, expiredRadius);
+        double width = waveRadius - innerRadius;
+        int rings = Math.clamp((int) Math.ceil(width / 5), 1, 8);
+        for (int ring = 0; ring < rings; ring++) {
+            double radius = innerRadius + width * (ring + .5) / rings;
+            int points = Math.clamp((int) Math.ceil(2 * Math.PI * radius / 5), 4, 48);
+            renderRing(radius, points, spot -> spot.getWorld().spawnParticle(Particle.DRAGON_BREATH, spot, 2, .2, .1, .2, .02, 1f));
         }
     }
 
@@ -133,6 +157,10 @@ final class PodiumCrystal {
 
     private void renderRing(double radius, Consumer<Location> emit) {
         int points = Math.clamp((int) Math.ceil(2 * Math.PI * radius), 12, 144);
+        renderRing(radius, points, emit);
+    }
+
+    private void renderRing(double radius, int points, Consumer<Location> emit) {
         for (int point = 0; point < points; point++) {
             double angle = 2 * Math.PI * point / points;
             Location spot = center.clone().add(radius * Math.cos(angle), 0, radius * Math.sin(angle));

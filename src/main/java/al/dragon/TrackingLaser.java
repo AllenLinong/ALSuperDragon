@@ -8,7 +8,6 @@ import org.bukkit.Location;
 import org.bukkit.Sound;
 import org.bukkit.entity.EnderDragon;
 import org.bukkit.entity.Player;
-import org.bukkit.util.Vector;
 
 final class TrackingLaser {
     private static final int AIM_DELAY_TICKS = 10;
@@ -16,22 +15,14 @@ final class TrackingLaser {
     private final Player target;
     private final Settings.TrackingBeam settings;
     private final double damage;
-    private final EnderDragon.Phase previousPhase;
-    private final boolean hadAi;
     private final ArrayDeque<Location> aimHistory = new ArrayDeque<>();
     private int age;
-    private boolean finished;
 
     TrackingLaser(EnderDragon dragon, Player target, Language language, Settings.TrackingBeam settings, double damageScale) {
         this.dragon = dragon;
         this.target = target;
         this.settings = settings;
         damage = settings.skill().damage() * damageScale;
-        previousPhase = dragon.getPhase();
-        hadAi = dragon.hasAI();
-        dragon.setPhase(EnderDragon.Phase.HOVER);
-        dragon.setAI(false);
-        dragon.setVelocity(new Vector());
         target.sendActionBar(language.message("tracking-laser-target", NamedTextColor.RED));
     }
 
@@ -84,11 +75,4 @@ final class TrackingLaser {
         return frame >= settings.durationTicks();
     }
 
-    void finish() {
-        if (finished) return;
-        finished = true;
-        if (!dragon.isValid() || dragon.isDead()) return;
-        dragon.setAI(hadAi);
-        if (dragon.getPhase() == EnderDragon.Phase.HOVER) dragon.setPhase(previousPhase);
-    }
 }
