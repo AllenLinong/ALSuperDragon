@@ -1,0 +1,80 @@
+# See docs/configuration.md for options and command placeholders.
+combat:
+  idle-reset-seconds: 3600
+  health: 680
+  damage-multiplier: 1.5
+  max-damage-per-hit-percent: 14
+  idle-critical:
+    enabled: false
+
+ai:
+  enabled: true
+  charge-interval-seconds: 19
+
+skills:
+  enabled: true
+  interval-seconds: 12
+  min-cast-gap-seconds: 5
+  recovery-seconds: 2.5
+  major-cooldown-seconds: 14
+  major-recovery-seconds: 3.0
+  fireball:
+    enabled: true
+    damage: 7.0
+  shockwave:
+    enabled: false
+  laser:
+    enabled: true
+    damage: 8.0
+  dive:
+    enabled: false
+  dragon-rush:
+    enabled: false
+  levitation-field:
+    enabled: false
+  breath-eruption:
+    enabled: true
+    damage: 5.0
+  crystal-burst:
+    enabled: false
+  sky-bite:
+    enabled: false
+  tracking-laser:
+    enabled: true
+    damage: 2.5
+  ender-roar:
+    enabled: false
+  podium-crystal:
+    enabled: false
+  finale:
+    enabled: false
+  crystals:
+    enabled: true
+  phantoms:
+    enabled: false
+  trail:
+    enabled: true
+  music:
+    enabled: false
+  void-rings:
+    enabled: true
+    damage: 7.0
+    health-percent: 50
+    warning-seconds: 2.25
+    radius: 7.0
+  gravity-well:
+    enabled: true
+    health-percent: 68
+    cooldown-seconds: 36
+    warning-seconds: 2.5
+    damage: 6.0
+    radius: 7.0
+
+rewards:
+  money:
+    total: 5000
+    command: 'eco give {player} {amount}'
+  dice:
+    enabled: true
+    commands:
+      - 'minecraft:give {player} minecraft:netherite_scrap 2'

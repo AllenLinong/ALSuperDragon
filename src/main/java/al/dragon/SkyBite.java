@@ -167,6 +167,19 @@ final class SkyBite {
         return true;
     }
 
+    static boolean tryNativeCharge(EnderDragon dragon, Location target) {
+        if (FLIGHT == null) return false;
+        dragon.setPhase(EnderDragon.Phase.CHARGE_PLAYER);
+        if (dragon.getPhase() != EnderDragon.Phase.CHARGE_PLAYER) return false;
+        try {
+            FLIGHT.aim(dragon, target);
+            return true;
+        } catch (ReflectiveOperationException exception) {
+            dragon.setPhase(EnderDragon.Phase.CIRCLING);
+            return false;
+        }
+    }
+
     private record FlightAccess(Method handle, Field headPart, Method bukkitPart, Method phaseManager,
                                 Method currentPhase, Method setTarget, Constructor<?> position) {
         static FlightAccess load() {
@@ -181,7 +194,7 @@ final class SkyBite {
                     manager.getReturnType().getMethod("getCurrentPhase"), charge.getMethod("setTarget", vector),
                     vector.getConstructor(double.class, double.class, double.class));
             } catch (ReflectiveOperationException | LinkageError exception) {
-                Bukkit.getLogger().log(Level.WARNING, "ALSuperDragon Sky Bite disabled: native dragon charge API unavailable", exception);
+                Bukkit.getLogger().log(Level.WARNING, "ALSuperDragon native dragon charging unavailable (Sky Bite and proactive AI)", exception);
                 return null;
             }
         }

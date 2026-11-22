@@ -1,0 +1,83 @@
+# See docs/configuration.md for options and command placeholders.
+combat:
+  idle-reset-seconds: 3600
+  health: 240
+  damage-multiplier: 1.0
+  max-damage-per-hit-percent: 25
+  idle-critical:
+    enabled: true
+
+ai:
+  enabled: false
+  charge-interval-seconds: 24
+
+skills:
+  enabled: true
+  interval-seconds: 17
+  min-cast-gap-seconds: 7
+  recovery-seconds: 2.5
+  major-cooldown-seconds: 18
+  major-recovery-seconds: 3.0
+  fireball:
+    enabled: true
+    damage: 4.0
+    health-percent: 60
+    warning-seconds: 2.0
+  shockwave:
+    enabled: true
+    damage: 3.0
+    warning-seconds: 2.0
+  laser:
+    enabled: false
+  dive:
+    enabled: false
+  dragon-rush:
+    enabled: false
+  levitation-field:
+    enabled: false
+  breath-eruption:
+    enabled: false
+  crystal-burst:
+    enabled: false
+  sky-bite:
+    enabled: false
+  tracking-laser:
+    enabled: false
+  ender-roar:
+    enabled: false
+  podium-crystal:
+    enabled: false
+  finale:
+    enabled: false
+  crystals:
+    enabled: true
+  phantoms:
+    enabled: false
+  trail:
+    enabled: true
+  music:
+    enabled: false
+  void-rings:
+    enabled: false
+  rift-mark:
+    enabled: true
+    health-percent: 80
+    cooldown-seconds: 24
+    warning-seconds: 1.75
+    damage: 3.0
+    radius: 3.5
+  crystal-revival:
+    enabled: true
+    health-percent: 55
+    cooldown-seconds: 30
+    warning-seconds: 2.0
+    heal-per-second: 2.0
+
+rewards:
+  money:
+    total: 1000
+    command: 'eco give {player} {amount}'
+  dice:
+    enabled: true
+    commands:
+      - 'minecraft:give {player} minecraft:diamond 2'

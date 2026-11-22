@@ -15,6 +15,7 @@ final class DragonParticles {
     private static final Color PINK = Color.fromRGB(255, 0, 248);
     private static final Color BLUE = Color.fromRGB(0, 26, 255);
     private static final Particle.DustTransition TRAIL = new Particle.DustTransition(PINK, BLUE, 3);
+    private static final Particle.DustTransition ARC = new Particle.DustTransition(Color.fromRGB(45, 138, 255), Color.fromRGB(218, 250, 255), 1.25f);
     private static final Particle.DustTransition FIREBALL = new Particle.DustTransition(PINK, BLUE, 2);
     private static final Particle.DustOptions LASER = new Particle.DustOptions(Color.fromRGB(255, 19, 248), 1);
     private static final Particle.DustOptions WAVE = new Particle.DustOptions(Color.fromRGB(255, 19, 249), 1.2f);
@@ -25,16 +26,17 @@ final class DragonParticles {
     private static final float[] OFFSETS = {-5, -4.5f, -4, -3.5f, -3, 0, 3, 3.5f, 4, 4.5f, 5};
 
     private final List<Player> viewers;
-    private final List<Location> positions;
+    private List<Location> positions;
+    private final List<Player> receivers = new ArrayList<>();
 
     DragonParticles(List<Player> viewers) {
         this.viewers = viewers;
-        positions = viewers.stream().map(Player::getLocation).toList();
     }
 
     private <T> void emit(Particle particle, Location spot, int count, double dx, double dy, double dz,
                           double speed, T data, double range, boolean force) {
-        List<Player> receivers = new ArrayList<>();
+        if (positions == null) positions = viewers.stream().map(Player::getLocation).toList();
+        receivers.clear();
         for (int index = 0; index < viewers.size(); index++) {
             if (positions.get(index).distanceSquared(spot) <= range * range) receivers.add(viewers.get(index));
         }
@@ -50,6 +52,31 @@ final class DragonParticles {
     void trail(Location spot) {
         emit(Particle.DUST_COLOR_TRANSITION, spot, 2, .6, .6, .6, 1, TRAIL, 256, true);
         emit(Particle.DRAGON_BREATH, spot, 2, .3, .3, .3, .02, null, 32, false);
+    }
+
+    void electricAura(Location center, int age) {
+        if (!loaded(center)) return;
+        if (positions == null) positions = viewers.stream().map(Player::getLocation).toList();
+        receivers.clear();
+        for (int index = 0; index < viewers.size(); index++) {
+            if (positions.get(index).distanceSquared(center) <= 64 * 64) receivers.add(viewers.get(index));
+        }
+        if (receivers.isEmpty()) return;
+        double yaw = Math.toRadians(center.getYaw());
+        double headingX = -Math.sin(yaw), headingZ = Math.cos(yaw);
+        var world = center.getWorld();
+        double phase = age * .18;
+        for (int side : new int[]{-1, 1}) {
+            for (int segment = 0; segment < 5; segment++) {
+                double along = (segment - 2) * 2.1;
+                double across = side * (2.1 + .7 * Math.sin(phase + segment * 1.6));
+                double x = center.getX() + headingX * along + headingZ * across;
+                double y = center.getY() + 2.3 + .8 * Math.sin(phase + segment * 1.4 + side);
+                double z = center.getZ() + headingZ * along - headingX * across;
+                world.spawnParticle(Particle.DUST_COLOR_TRANSITION, receivers, null, x, y, z, 1, 0, 0, 0, 0, ARC, true);
+                if (segment == 2) world.spawnParticle(Particle.ELECTRIC_SPARK, receivers, null, x, y, z, 2, .2, .35, .2, .025, null, true);
+            }
+        }
     }
 
     void phaseBurst(Location spot) {

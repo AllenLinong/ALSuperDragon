@@ -1,0 +1,5 @@
+# Lifetime caps per player UUID, shared across all dragons and worlds.
+# -1 = unlimited; 0 = disabled. Counts do not reset on restart.
+limits:
+  money-max-times: 5
+  dice-max-times: 3

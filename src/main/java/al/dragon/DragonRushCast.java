@@ -178,10 +178,10 @@ final class DragonRushCast {
             spot.setZ(next.getZ());
             if (decoy != null) {
                 if (!decoy.isValid() || !decoy.teleport(spot.clone().setDirection(heading.clone().multiply(-1)))) return remove();
-            } else {
+            } else if (ticks % 2 == 0) {
                 for (Part part : parts) if (!part.display.isValid() || !part.display.teleport(pose(part.offset))) return remove();
             }
-            spot.getWorld().spawnParticle(Particle.DRAGON_BREATH, spot, trailCount, .24, .24, .24, .015, 1f);
+            if (ticks % 2 == 0) spot.getWorld().spawnParticle(Particle.DRAGON_BREATH, spot, trailCount, .24, .24, .24, .015, 1f);
             if (phaseTicks % 12 == 1) spot.getWorld().playSound(spot, Sound.ENTITY_ENDER_DRAGON_FLAP, SoundCategory.HOSTILE, 1.2f, 1.25f);
             return false;
         }
@@ -241,7 +241,7 @@ final class DragonRushCast {
 
     private static void size(Display display, float width, float height, float length, boolean centerBlock) {
         display.setPersistent(false);
-        display.setTeleportDuration(1);
+        display.setTeleportDuration(2);
         var transform = display.getTransformation();
         transform.getScale().set(width, height, length);
         if (centerBlock) transform.getTranslation().set(-width / 2, -height / 2, -length / 2);

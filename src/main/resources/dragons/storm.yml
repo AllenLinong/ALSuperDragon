@@ -1,0 +1,97 @@
+# See docs/configuration.md for options and command placeholders.
+combat:
+  idle-reset-seconds: 3600
+  health: 420
+  damage-multiplier: 1.25
+  max-damage-per-hit-percent: 18
+  idle-critical:
+    enabled: true
+
+ai:
+  enabled: true
+  charge-interval-seconds: 24
+
+skills:
+  enabled: true
+  interval-seconds: 14
+  min-cast-gap-seconds: 6
+  recovery-seconds: 2.5
+  major-cooldown-seconds: 16
+  major-recovery-seconds: 3.0
+  fireball:
+    enabled: false
+  shockwave:
+    enabled: true
+    damage: 5.0
+  laser:
+    enabled: false
+  dive:
+    enabled: true
+    damage: 6.0
+    combo-count: 2
+  dragon-rush:
+    enabled: false
+  levitation-field:
+    enabled: true
+    health-percent: 80
+  breath-eruption:
+    enabled: false
+  crystal-burst:
+    enabled: true
+    damage: 5.0
+  sky-bite:
+    enabled: false
+  tracking-laser:
+    enabled: false
+  ender-roar:
+    enabled: false
+  podium-crystal:
+    enabled: false
+  finale:
+    enabled: false
+  crystals:
+    enabled: true
+  phantoms:
+    enabled: true
+    count: 2
+  electric-aura:
+    enabled: true
+    interval-ticks: 5
+  entrance-storm:
+    damage: 3.0
+  trail:
+    enabled: true
+  music:
+    enabled: false
+  void-rings:
+    enabled: false
+  thunder:
+    enabled: true
+    health-percent: 90
+    cooldown-seconds: 22
+    warning-seconds: 1.25
+    damage: 5.0
+    radius: 2.5
+  thunderstorm:
+    enabled: true
+    health-percent: 45
+    cooldown-seconds: 42
+    warning-seconds: 1.25
+    damage: 3.0
+    radius: 2.1
+  thunder-chain:
+    enabled: true
+    health-percent: 70
+    cooldown-seconds: 30
+    warning-seconds: 2.5
+    damage: 5.0
+    radius: 8.0
+
+rewards:
+  money:
+    total: 2400
+    command: 'eco give {player} {amount}'
+  dice:
+    enabled: true
+    commands:
+      - 'minecraft:give {player} minecraft:diamond 5'

@@ -1,0 +1,88 @@
+# See docs/configuration.md for options and command placeholders.
+combat:
+  idle-reset-seconds: 3600
+  health: 1000
+  damage-multiplier: 1.8
+  max-damage-per-hit-percent: 10
+  idle-critical:
+    enabled: false
+
+ai:
+  enabled: true
+  charge-interval-seconds: 14
+
+skills:
+  enabled: true
+  interval-seconds: 10
+  min-cast-gap-seconds: 5
+  recovery-seconds: 2
+  major-cooldown-seconds: 12
+  major-recovery-seconds: 3.0
+  fireball:
+    enabled: true
+    damage: 8.0
+  shockwave:
+    enabled: true
+    damage: 6.0
+  laser:
+    enabled: false
+  dive:
+    enabled: true
+    damage: 8.0
+    combo-count: 3
+  dragon-rush:
+    enabled: true
+    damage: 6.0
+  levitation-field:
+    enabled: false
+  breath-eruption:
+    enabled: false
+  crystal-burst:
+    enabled: false
+  sky-bite:
+    enabled: true
+    damage: 1.25
+  tracking-laser:
+    enabled: false
+  ender-roar:
+    enabled: true
+    cooldown-seconds: 16
+  podium-crystal:
+    enabled: true
+    blast-damage: 28.0
+    blast-radius: 32.0
+  finale:
+    enabled: true
+    damage: 22.0
+  crystals:
+    enabled: true
+  phantoms:
+    enabled: true
+    count: 4
+  trail:
+    enabled: true
+  music:
+    enabled: false
+  void-rings:
+    enabled: true
+    damage: 9.0
+    health-percent: 65
+    cooldown-seconds: 24
+    warning-seconds: 2.0
+    radius: 8.0
+  end-cross:
+    enabled: true
+    health-percent: 45
+    cooldown-seconds: 35
+    warning-seconds: 1.6
+    damage: 8.0
+    radius: 8.0
+
+rewards:
+  money:
+    total: 10000
+    command: 'eco give {player} {amount}'
+  dice:
+    enabled: true
+    commands:
+      - 'minecraft:give {player} minecraft:netherite_ingot 1'

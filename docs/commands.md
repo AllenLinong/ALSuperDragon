@@ -1,14 +1,14 @@
 # 指令与权限
 
-[返回 Wiki 首页](README.md)
-
-权限默认授予 OP，也可单独授权。控制台输入时不加 `/`。
-
-| 指令 | 权限 | 使用条件与效果 |
+| 指令 | 权限（默认 OP） | 用途 |
 | --- | --- | --- |
-| `/alsuperdragon reload` | `alsuperdragon.reload` | 玩家或控制台均可执行；重新读取配置及语言。 |
-| `/alsuperdragon summon <血量倍率>` | `alsuperdragon.summon` | 仅末地龙战所在世界的玩家可用；首龙必须已被击败，且没有主龙或正在进行的复活流程。插件在祭坛放置临时水晶，无需手动摆放。 |
-| `/alsuperdragon resetpity [末地世界名]` | `alsuperdragon.resetpity` | 只清零指定世界的保底。末地玩家可省略世界名，控制台必填。 |
+| `/aldragon reload` | `alsuperdragon.reload` | 重读主配置、四份龙配置和语言；失败时保留当前配置 |
+| `/aldragon summon random` | `alsuperdragon.summon` | 出龙时按主配置概率选种，也可省略 `random` 或写 `随机` |
+| `/aldragon summon scout` | `alsuperdragon.summon` | 指定巡界龙，也可写 `巡界龙` |
+| `/aldragon summon storm` | `alsuperdragon.summon` | 指定雷霆龙，也可写 `雷霆龙` |
+| `/aldragon summon abyss` | `alsuperdragon.summon` | 指定深渊龙，也可写 `深渊龙` |
+| `/aldragon summon sovereign` | `alsuperdragon.summon` | 指定终末龙，也可写 `终末龙` |
 
-- `/alsuperdragon summon 3` 启动原版复活流程，设置血量 ×3、伤害 ×1.5，不会立即生成独立龙。合法血量倍率为 `0.1–5.12`，伤害倍率为所填数值的一半。
-- `alsuperdragon resetpity world_the_end` 是控制台示例；请把 `world_the_end` 换成实际已加载的末地世界名。其他世界不受影响。
+`/alsuperdragon` 仍可用。有召唤权限的末地玩家可以用 Tab 补全中英文龙种。指定召唤只跳过龙种抽签，不改变该龙的龙蛋掉率。
+
+召唤指令须由玩家在已完成首杀的末地执行，且不能有主龙或仪式正在进行。指令启动原版仪式，不会立即生成独立龙；手动摆四个末影水晶复活仍按概率选种。新版不再接受数字倍率，也没有 `resetpity` 指令。

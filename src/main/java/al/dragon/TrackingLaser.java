@@ -42,6 +42,7 @@ final class TrackingLaser {
             return false;
         }
         if (frame == 1) origin.getWorld().playSound(origin, Sound.ENTITY_ENDER_DRAGON_GROWL, 3, 1.25f);
+        if (frame != 1 && frame % 2 != 0) return frame >= settings.durationTicks();
         var start = origin.toVector();
         var direction = aimHistory.getFirst().toVector().subtract(start);
         double targetDistance = direction.length();
@@ -62,7 +63,7 @@ final class TrackingLaser {
             var hit = origin.getWorld().rayTraceBlocks(origin, direction, length, FluidCollisionMode.NEVER, true);
             Location end = hit == null ? origin.clone().add(direction.clone().multiply(length)) : hit.getHitPosition().toLocation(origin.getWorld());
             double beamLength = origin.distance(end);
-            if (frame == 1 || frame % 2 == 0) particles.trackingBeam(origin, direction, beamLength, end, hit != null);
+            particles.trackingBeam(origin, direction, beamLength, end, hit != null);
             if (frame % 10 == 0 && beamLength > .001) {
                 var contact = hitbox.rayTrace(start, direction, beamLength);
                 if (hitbox.contains(start) || (contact != null

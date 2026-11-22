@@ -2,8 +2,9 @@ package al.dragon;
 
 import java.io.File;
 import java.io.IOException;
-import java.math.BigDecimal;
-import java.math.RoundingMode;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -51,24 +52,62 @@ import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
+import org.bukkit.event.entity.EntityRemoveEvent;
+import org.bukkit.event.world.EntitiesLoadEvent;
+import org.bukkit.event.world.WorldLoadEvent;
+import org.bukkit.event.world.WorldUnloadEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityChangeBlockEvent;
 import org.bukkit.event.entity.ExplosionPrimeEvent;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitTask;
 
 public final class ALDragon extends JavaPlugin implements Listener {
-    private final NamespacedKey healthKey = storedKey("health_multiplier");
+    private static final int DRAGON_REGISTRATION_RETRIES = 4;
+    private static final int DRAGON_RETRY_DELAY = 5;
+    private static final int REWARD_COMMANDS_PER_TICK = 4;
+    private static final long REWARD_TICK_BUDGET_NANOS = 2_000_000;
+    private static final Map<String, String> SUMMON_ALIASES = Map.of(
+        "随机", "random", "巡界龙", "scout", "巡界", "scout", "雷霆龙", "storm", "雷霆", "storm",
+        "深渊龙", "abyss", "深渊", "abyss", "终末龙", "sovereign", "终末", "sovereign");
+    private static final List<String> SUMMON_OPTIONS = List.of("random", "scout", "storm", "abyss", "sovereign", "随机", "巡界龙", "雷霆龙", "深渊龙", "终末龙");
+    private final NamespacedKey profileKey = storedKey("dragon_profile");
     private final NamespacedKey damageKey = storedKey("damage_multiplier");
     private final NamespacedKey lastDamageKey = storedKey("last_damage_at");
-    private final NamespacedKey missesKey = storedKey("egg_misses");
+    private final NamespacedKey idleDamageKey = storedKey("idle_reset_damage_at");
     private final Set<UUID> eggDecisions = new HashSet<>();
     private final Map<UUID, PendingSummon> pendingSummons = new HashMap<>();
-    private Settings settings;
+    private final Map<UUID, Encounter> encounters = new HashMap<>();
+    private List<World> watchedWorlds = List.of();
+    private final Set<UUID> activeDragons = new HashSet<>();
+    private final ArrayDeque<Runnable> rewardCommands = new ArrayDeque<>();
+    private BukkitTask battleTask;
+    private BukkitTask rewardTask;
+    private BukkitTask rewardSaveTask;
+    private RewardLedger rewardLedger;
+    private RewardLedger.Limits rewardLimits;
+    private DragonProfiles profiles;
     private DragonSkills skills;
     private Language language;
 
-    private record PendingSummon(double multiplier, List<EnderCrystal> crystals, Player requester) {}
+    private record PendingSummon(DragonProfiles.Profile profile, List<EnderCrystal> crystals, UUID requester) {}
+
+    private static final class Encounter {
+        private final UUID dragon;
+        private final DragonProfiles.Profile profile;
+        private final DragonRewards rewards = new DragonRewards();
+        private long idleDamageAt;
+        private int lastCurrent = -1;
+        private int lastMax = -1;
+        private Language lastLanguage;
+        private boolean rewarded;
+
+        private Encounter(UUID dragon, DragonProfiles.Profile profile) {
+            this.dragon = dragon;
+            this.profile = profile;
+        }
+    }
 
     static NamespacedKey storedKey(String key) {
         return NamespacedKey.fromString("aldragon:" + key);
@@ -76,21 +115,25 @@ public final class ALDragon extends JavaPlugin implements Listener {
 
     @Override
     public void onEnable() {
-        language = new Language(this);
-        settings = Settings.load(getConfig());
-        skills = new DragonSkills(settings, language);
+        try {
+            loadSettings();
+            rewardLedger = new RewardLedger(getDataFolder().toPath().resolve("reward-counts.tsv"));
+        } catch (IOException | InvalidConfigurationException | RuntimeException exception) {
+            throw new IllegalStateException("Could not load ALSuperDragon configuration", exception);
+        }
+        skills = new DragonSkills(language);
         var command = Objects.requireNonNull(getCommand("alsuperdragon"));
         command.setExecutor(this::handleCommand);
         command.setTabCompleter(this::completeCommand);
         Bukkit.getPluginManager().registerEvents(this, this);
-        Bukkit.getScheduler().runTaskTimer(this, this::tick, 1, 1);
+        Bukkit.getWorlds().forEach(this::watchExistingDragon);
     }
 
     private boolean handleCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) return false;
         String action = args[0].toLowerCase(Locale.ROOT);
         switch (action) {
-            case "reload", "summon", "resetpity" -> {
+            case "reload", "summon" -> {
                 if (!sender.hasPermission("alsuperdragon." + action)) {
                     sender.sendMessage(language.message("command-denied", NamedTextColor.RED));
                     return true;
@@ -100,22 +143,22 @@ public final class ALDragon extends JavaPlugin implements Listener {
         }
         return switch (action) {
             case "reload" -> args.length == 1 && reloadSettings(sender);
-            case "summon" -> args.length == 2 && summonDragon(sender, args[1]);
-            case "resetpity" -> args.length <= 2 && resetPity(sender, args.length == 2 ? args[1] : null);
+            case "summon" -> args.length <= 2 && summonDragon(sender, args.length == 2 ? args[1] : null);
             default -> false;
         };
     }
 
     private List<String> completeCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 1) {
-            return List.of("reload", "summon", "resetpity").stream()
+            return List.of("reload", "summon").stream()
                 .filter(action -> sender.hasPermission("alsuperdragon." + action))
                 .filter(action -> !action.equals("summon") || sender instanceof Player player && isDragonWorld(player.getWorld()))
                 .filter(action -> action.startsWith(args[0].toLowerCase(Locale.ROOT))).toList();
         }
-        if (args.length == 2 && args[0].equalsIgnoreCase("resetpity") && sender.hasPermission("alsuperdragon.resetpity")) {
-            return Bukkit.getWorlds().stream().filter(ALDragon::isDragonWorld).map(World::getName)
-                .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(args[1].toLowerCase(Locale.ROOT))).toList();
+        if (args.length == 2 && args[0].equalsIgnoreCase("summon") && sender.hasPermission("alsuperdragon.summon")
+            && sender instanceof Player player && isDragonWorld(player.getWorld())) {
+            String prefix = args[1].toLowerCase(Locale.ROOT);
+            return SUMMON_OPTIONS.stream().filter(id -> id.startsWith(prefix)).toList();
         }
         return List.of();
     }
@@ -129,19 +172,16 @@ public final class ALDragon extends JavaPlugin implements Listener {
             sender.sendMessage(language.message("summon-end-only", NamedTextColor.RED));
             return true;
         }
-        double multiplier;
-        try {
-            multiplier = Double.parseDouble(value);
-        } catch (NumberFormatException exception) {
-            multiplier = Double.NaN;
-        }
-        if (!Double.isFinite(multiplier) || multiplier < .1 || multiplier > 5.12) {
-            sender.sendMessage(language.message("summon-invalid-multiplier", NamedTextColor.RED));
+        String selection = value == null ? "random" : value.toLowerCase(Locale.ROOT);
+        String profileId = SUMMON_ALIASES.getOrDefault(selection, selection);
+        DragonProfiles.Profile forced = profiles.get(profileId);
+        if (forced == null && !profileId.equals("random")) {
+            sender.sendMessage(language.message("summon-invalid-profile", NamedTextColor.RED));
             return true;
         }
         World world = player.getWorld();
         DragonBattle battle = world.getEnderDragonBattle();
-        if (battle.getEnderDragon() != null || !battle.hasBeenPreviouslyKilled()
+        if (pendingSummons.containsKey(world.getUID()) || battle.getEnderDragon() != null || !battle.hasBeenPreviouslyKilled()
             || battle.getRespawnPhase() != DragonBattle.RespawnPhase.NONE) {
             sender.sendMessage(language.message("summon-unavailable", NamedTextColor.RED));
             return true;
@@ -175,36 +215,41 @@ public final class ALDragon extends JavaPlugin implements Listener {
             sender.sendMessage(language.message("summon-start-failed", NamedTextColor.RED));
             return true;
         }
-        pendingSummons.put(world.getUID(), new PendingSummon(multiplier, crystals, player));
-        sender.sendMessage(Component.text(language.text("summon-started")
-            .replace("{health}", Double.toString(multiplier)).replace("{damage}", Double.toString(multiplier / 2)), NamedTextColor.GREEN));
+        pendingSummons.put(world.getUID(), new PendingSummon(forced, crystals, player.getUniqueId()));
+        watchWorld(world);
+        sender.sendMessage(forced == null ? language.message("summon-random-started", NamedTextColor.GREEN)
+            : Component.text(language.text("summon-specific-started").replace("{dragon}", dragonName(forced)), NamedTextColor.GREEN));
         return true;
     }
 
-    private boolean resetPity(CommandSender sender, String worldName) {
-        World world = worldName != null ? Bukkit.getWorld(worldName) : sender instanceof Player player ? player.getWorld() : null;
-        if (!isDragonWorld(world)) {
-            sender.sendMessage(language.message("resetpity-world-required", NamedTextColor.RED));
-            return true;
+    private void loadSettings() throws IOException, InvalidConfigurationException {
+        saveDefaultConfig();
+        var config = new YamlConfiguration();
+        config.load(new File(getDataFolder(), "config.yml"));
+        if (!config.isSet("dragons") && config.isSet("config-version")) {
+            try (var reader = new InputStreamReader(Objects.requireNonNull(getResource("config.yml")), StandardCharsets.UTF_8)) {
+                var defaults = new YamlConfiguration();
+                defaults.load(reader);
+                config.setDefaults(defaults);
+            }
+            getLogger().warning("Legacy config.yml: using default dragon chances. Back it up and regenerate it to customize chances.");
         }
-        var data = world.getPersistentDataContainer();
-        int previous = data.getOrDefault(missesKey, PersistentDataType.INTEGER, 0);
-        data.set(missesKey, PersistentDataType.INTEGER, 0);
-        sender.sendMessage(Component.text(language.text("resetpity-success").replace("{count}", Integer.toString(previous))
-            .replace("{world}", world.getName()), NamedTextColor.GREEN));
-        return true;
+        var updatedProfiles = DragonProfiles.load(this, config);
+        var updatedLanguage = new Language(this, config);
+        File rewardsFile = new File(getDataFolder(), "rewards.yml");
+        if (!rewardsFile.exists()) saveResource("rewards.yml", false);
+        var rewardsConfig = new YamlConfiguration();
+        rewardsConfig.load(rewardsFile);
+        var updatedLimits = RewardLedger.Limits.load(rewardsConfig);
+        profiles = updatedProfiles;
+        language = updatedLanguage;
+        rewardLimits = updatedLimits;
+        if (skills != null) skills.updateLanguage(language);
     }
 
     private boolean reloadSettings(CommandSender sender) {
         try {
-            saveDefaultConfig();
-            new YamlConfiguration().load(new File(getDataFolder(), "config.yml"));
-            reloadConfig();
-            var updatedLanguage = new Language(this, true);
-            var updatedSettings = Settings.load(getConfig());
-            skills.updateSettings(updatedSettings, updatedLanguage);
-            settings = updatedSettings;
-            language = updatedLanguage;
+            loadSettings();
             sender.sendMessage(language.message("reload-success", NamedTextColor.GREEN));
         } catch (IOException | InvalidConfigurationException | RuntimeException exception) {
             getLogger().log(Level.WARNING, "Could not reload ALSuperDragon configuration", exception);
@@ -215,6 +260,16 @@ public final class ALDragon extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
+        stopBattleTask();
+        stopRewardTask();
+        if (rewardSaveTask != null) rewardSaveTask.cancel();
+        rewardSaveTask = null;
+        if (rewardLedger != null) saveRewardCounts(rewardLedger, rewardLedger.snapshot());
+        if (!rewardCommands.isEmpty()) {
+            getLogger().warning("Stopping with " + rewardCommands.size() + " unprocessed dragon reward commands; they will not be retried.");
+            rewardCommands.clear();
+        }
+        watchedWorlds = List.of();
         if (skills != null) {
             skills.retain(Set.of());
             skills.clearPodiumCrystals();
@@ -222,65 +277,180 @@ public final class ALDragon extends JavaPlugin implements Listener {
     }
 
     private void tick() {
-        Set<UUID> active = new HashSet<>();
-        for (World world : Bukkit.getWorlds()) {
-            if (world.getEnvironment() != World.Environment.THE_END) continue;
+        activeDragons.clear();
+        List<World> snapshot = watchedWorlds;
+        for (World world : snapshot) {
+            if (snapshot != watchedWorlds && !watchedWorlds.contains(world)) continue;
+            UUID worldId = world.getUID();
             DragonBattle battle = world.getEnderDragonBattle();
-            if (battle == null) continue;
-            EnderDragon dragon = battle.getEnderDragon();
+            EnderDragon dragon = battle == null ? null : battle.getEnderDragon();
             if (dragon == null || DragonRushCast.isDecoy(dragon)) {
-                if (battle.getRespawnPhase() == DragonBattle.RespawnPhase.NONE) {
-                    PendingSummon pending = pendingSummons.remove(world.getUID());
-                    if (pending != null) {
-                        pending.crystals().forEach(EnderCrystal::remove);
-                        if (pending.requester().isOnline()) {
-                            pending.requester().sendMessage(language.message("summon-interrupted", NamedTextColor.RED));
-                        }
-                    }
-                }
+                PendingSummon pending = pendingSummons.get(worldId);
+                if (pending != null && battle != null && battle.getRespawnPhase() != DragonBattle.RespawnPhase.NONE) continue;
+                unwatchWorld(world);
+                if (pending == null) continue;
+                pendingSummons.remove(worldId);
+                pending.crystals().forEach(EnderCrystal::remove);
+                Player requester = Bukkit.getPlayer(pending.requester());
+                if (requester != null) requester.sendMessage(language.message("summon-interrupted", NamedTextColor.RED));
                 continue;
             }
             boolean alive = !dragon.isDead() && dragon.getHealth() > 0 && dragon.getPhase() != EnderDragon.Phase.DYING;
-            boolean enhanced = battle.hasBeenPreviouslyKilled() || settings.includeFirst();
-            if (alive && enhanced) initialize(dragon);
-            updateHealthTitle(dragon);
-            if (!alive || !enhanced) continue;
-            active.add(dragon.getUniqueId());
-            skills.tick(dragon, battle);
+            if (!alive) continue;
+            Encounter encounter = initialize(dragon);
+            if (encounter.idleDamageAt > 0) resetIdleEncounter(dragon, encounter, System.currentTimeMillis());
+            updateHealthTitle(dragon, encounter);
+            activeDragons.add(dragon.getUniqueId());
+            skills.tick(dragon, battle, encounter.profile.combat());
         }
-        skills.retain(active);
-        skills.tickPodiumCrystals(active);
+        skills.retain(activeDragons);
+        skills.tickPodiumCrystals(activeDragons);
+        if (watchedWorlds.isEmpty()) stopBattleTask();
     }
 
-    private void updateHealthTitle(EnderDragon dragon) {
+    private void watchExistingDragon(World world) {
+        if (world.getEnvironment() != World.Environment.THE_END) return;
+        DragonBattle battle = world.getEnderDragonBattle();
+        EnderDragon dragon = battle == null ? null : battle.getEnderDragon();
+        if (dragon != null && !DragonRushCast.isDecoy(dragon)) watchWorld(world);
+    }
+
+    private void watchWorld(World world) {
+        if (watchedWorlds.contains(world)) return;
+        var watched = new ArrayList<>(watchedWorlds);
+        watched.add(world);
+        watchedWorlds = List.copyOf(watched);
+        if (battleTask == null) battleTask = Bukkit.getScheduler().runTaskTimer(this, this::tick, 1, 1);
+    }
+
+    private void unwatchWorld(World world) {
+        if (watchedWorlds.contains(world)) watchedWorlds = watchedWorlds.stream().filter(watched -> !watched.equals(world)).toList();
+    }
+
+    private void stopBattleTask() {
+        if (battleTask == null) return;
+        battleTask.cancel();
+        battleTask = null;
+    }
+
+    boolean rewardAvailable(RewardLedger.Key key) {
+        return rewardLedger.available(key, rewardLimits);
+    }
+
+    boolean reserveReward(RewardLedger.Key key) {
+        return rewardLedger.reserve(key, rewardLimits);
+    }
+
+    void finishReward(RewardLedger.Key key, boolean accepted) {
+        if (!rewardLedger.finish(key, accepted) || rewardSaveTask != null) return;
+        rewardSaveTask = Bukkit.getScheduler().runTaskLater(this, () -> {
+            rewardSaveTask = null;
+            RewardLedger ledger = rewardLedger;
+            var snapshot = ledger.snapshot();
+            if (snapshot != null) Bukkit.getScheduler().runTaskAsynchronously(this, () -> saveRewardCounts(ledger, snapshot));
+        }, 20);
+    }
+
+    private void saveRewardCounts(RewardLedger ledger, RewardLedger.Snapshot snapshot) {
+        if (snapshot == null) return;
+        try {
+            ledger.save(snapshot);
+        } catch (IOException exception) {
+            getLogger().log(Level.SEVERE, "Could not save dragon reward counts", exception);
+        }
+    }
+
+    void enqueueReward(Runnable command) {
+        rewardCommands.addLast(command);
+        if (rewardTask == null) rewardTask = Bukkit.getScheduler().runTaskTimer(this, this::drainRewards, 1, 1);
+    }
+
+    private void drainRewards() {
+        long start = System.nanoTime();
+        for (int count = 0; count < REWARD_COMMANDS_PER_TICK; count++) {
+            Runnable command = rewardCommands.pollFirst();
+            if (command == null) break;
+            try {
+                command.run();
+            } catch (RuntimeException exception) {
+                getLogger().log(Level.WARNING, "Could not process a queued dragon reward", exception);
+            }
+            if (System.nanoTime() - start >= REWARD_TICK_BUDGET_NANOS) break;
+        }
+        if (rewardCommands.isEmpty()) stopRewardTask();
+    }
+
+    private void stopRewardTask() {
+        if (rewardTask == null) return;
+        rewardTask.cancel();
+        rewardTask = null;
+    }
+
+    private void updateHealthTitle(EnderDragon dragon, Encounter encounter) {
         AttributeInstance health = dragon.getAttribute(Attribute.MAX_HEALTH);
         if (health == null) return;
         int current = (int) Math.ceil(dragon.getHealth());
         int maximum = (int) Math.ceil(health.getValue());
-        Component title = Component.text(language.text("boss-bar").replace("{current}", Integer.toString(current))
-            .replace("{max}", Integer.toString(maximum)));
-        if (!title.equals(dragon.customName())) dragon.customName(title);
+        if (current == encounter.lastCurrent && maximum == encounter.lastMax && language == encounter.lastLanguage) return;
+        encounter.lastCurrent = current;
+        encounter.lastMax = maximum;
+        encounter.lastLanguage = language;
+        dragon.customName(Component.text(language.text("profile-boss-bar").replace("{current}", Integer.toString(current))
+            .replace("{max}", Integer.toString(maximum)).replace("{dragon}", dragonName(encounter.profile))));
     }
 
-    private void initialize(EnderDragon dragon) {
+    static boolean idleResetDue(long damageAt, long timeout, long now) {
+        return damageAt > 0 && timeout > 0 && now - damageAt >= timeout;
+    }
+
+    private void resetIdleEncounter(EnderDragon dragon, Encounter encounter, long now) {
+        if (!idleResetDue(encounter.idleDamageAt, encounter.profile.combat().idleResetMillis(), now)) return;
+        AttributeInstance health = dragon.getAttribute(Attribute.MAX_HEALTH);
+        if (health == null) return;
+        if (dragon.getHealth() < health.getValue()) dragon.setHealth(health.getValue());
+        encounter.rewards.clearHits();
+        encounter.idleDamageAt = 0;
+        dragon.getPersistentDataContainer().remove(idleDamageKey);
+    }
+
+    private String dragonName(DragonProfiles.Profile profile) {
+        return language.text("dragon-" + profile.id());
+    }
+
+    private Encounter initialize(EnderDragon dragon) {
+        UUID world = dragon.getWorld().getUID();
+        Encounter existing = encounters.get(world);
+        if (existing != null && existing.dragon.equals(dragon.getUniqueId())) return existing;
         var data = dragon.getPersistentDataContainer();
-        if (settings.idleCritical().enabled() && !data.has(lastDamageKey, PersistentDataType.LONG)) {
+        PendingSummon pending = pendingSummons.remove(world);
+        DragonProfiles.Profile profile = profiles.get(data.get(profileKey, PersistentDataType.STRING));
+        if (profile == null) {
+            profile = pending != null && pending.profile() != null ? pending.profile() : profiles.select(ThreadLocalRandom.current().nextDouble(100));
+            AttributeInstance health = dragon.getAttribute(Attribute.MAX_HEALTH);
+            if (health != null) {
+                double fraction = dragon.getHealth() / health.getValue();
+                health.setBaseValue(profile.combat().health());
+                dragon.setHealth(Math.min(health.getValue(), health.getValue() * fraction));
+            }
+            data.set(profileKey, PersistentDataType.STRING, profile.id());
+            data.set(damageKey, PersistentDataType.DOUBLE, profile.combat().damage());
+        }
+        if (profile.combat().idleCritical().enabled() && !data.has(lastDamageKey, PersistentDataType.LONG)) {
             data.set(lastDamageKey, PersistentDataType.LONG, System.currentTimeMillis());
         }
-        if (data.has(healthKey, PersistentDataType.DOUBLE)) return;
-        PendingSummon pending = pendingSummons.remove(dragon.getWorld().getUID());
-        Double forced = pending == null ? null : pending.multiplier();
-        AttributeInstance health = dragon.getAttribute(Attribute.MAX_HEALTH);
-        double actualMultiplier = 1;
-        if (health != null) {
-            double originalMax = health.getValue();
-            double fraction = dragon.getHealth() / originalMax;
-            health.setBaseValue(Math.clamp(health.getBaseValue() * (forced == null ? settings.health().roll() : forced), 1, 1024));
-            actualMultiplier = health.getValue() / originalMax;
-            dragon.setHealth(Math.min(health.getValue(), health.getValue() * fraction));
+        Encounter encounter = new Encounter(dragon.getUniqueId(), profile);
+        if (profile.combat().idleResetMillis() > 0) {
+            encounter.idleDamageAt = data.getOrDefault(idleDamageKey, PersistentDataType.LONG, 0L);
+            if (encounter.idleDamageAt == 0) {
+                AttributeInstance health = dragon.getAttribute(Attribute.MAX_HEALTH);
+                if (health != null && dragon.getHealth() < health.getValue()) {
+                    encounter.idleDamageAt = System.currentTimeMillis();
+                    data.set(idleDamageKey, PersistentDataType.LONG, encounter.idleDamageAt);
+                }
+            }
         }
-        data.set(healthKey, PersistentDataType.DOUBLE, actualMultiplier);
-        data.set(damageKey, PersistentDataType.DOUBLE, forced == null ? settings.damage().roll() : forced / 2);
+        encounters.put(world, encounter);
+        return encounter;
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
@@ -302,8 +472,9 @@ public final class ALDragon extends JavaPlugin implements Listener {
     public void onDragonIncomingDamage(EntityDamageEvent event) {
         EnderDragon dragon = enhancedDragonTarget(event.getEntity());
         if (dragon == null) return;
-        if (event instanceof EntityDamageByEntityEvent attack) applyIdleCritical(attack, dragon);
-        double percent = settings.maxDamagePerHitPercent();
+        Settings combat = initialize(dragon).profile.combat();
+        if (event instanceof EntityDamageByEntityEvent attack) applyIdleCritical(attack, dragon, combat.idleCritical());
+        double percent = combat.maxDamagePerHitPercent();
         if (percent <= 0) return;
         AttributeInstance health = dragon.getAttribute(Attribute.MAX_HEALTH);
         if (health == null) return;
@@ -311,33 +482,50 @@ public final class ALDragon extends JavaPlugin implements Listener {
         if (event.getDamage() > limit) event.setDamage(limit);
     }
 
-    private void applyIdleCritical(EntityDamageByEntityEvent event, EnderDragon dragon) {
-        var critical = settings.idleCritical();
-        if (!critical.enabled() || event.getFinalDamage() <= 0) return;
-        Entity attacker = event.getDamageSource().getCausingEntity();
-        Entity damager = event.getDamager();
-        if (!(attacker instanceof Player) && !(damager instanceof Player)
-            && !(damager instanceof Projectile projectile && projectile.getShooter() instanceof Player)) return;
+    private void applyIdleCritical(EntityDamageByEntityEvent event, EnderDragon dragon, Settings.IdleCritical critical) {
+        if (!critical.enabled() || event.getFinalDamage() <= 0 || attacker(event) == null) return;
         Long lastDamage = dragon.getPersistentDataContainer().get(lastDamageKey, PersistentDataType.LONG);
         if (lastDamage != null && System.currentTimeMillis() - lastDamage >= critical.idleMillis()) {
             event.setDamage(event.getDamage() * critical.multiplier());
         }
     }
 
+    private static Player attacker(EntityDamageByEntityEvent event) {
+        if (event.getDamageSource().getCausingEntity() instanceof Player player) return player;
+        if (event.getDamager() instanceof Player player) return player;
+        if (event.getDamager() instanceof Projectile projectile && projectile.getShooter() instanceof Player player) return player;
+        return null;
+    }
+
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onDragonDamaged(EntityDamageEvent event) {
-        if (!settings.idleCritical().enabled() || event.getFinalDamage() <= 0) return;
+        double damage = event.getFinalDamage();
+        if (!Double.isFinite(damage) || damage <= 0) return;
         EnderDragon dragon = enhancedDragonTarget(event.getEntity());
-        if (dragon != null) dragon.getPersistentDataContainer().set(lastDamageKey, PersistentDataType.LONG, System.currentTimeMillis());
+        if (dragon == null) return;
+        Encounter encounter = initialize(dragon);
+        long now = System.currentTimeMillis();
+        if (encounter.profile.combat().idleResetMillis() > 0) {
+            resetIdleEncounter(dragon, encounter, now);
+            encounter.idleDamageAt = now;
+            dragon.getPersistentDataContainer().set(idleDamageKey, PersistentDataType.LONG, now);
+        }
+        if (encounter.profile.combat().idleCritical().enabled()) {
+            dragon.getPersistentDataContainer().set(lastDamageKey, PersistentDataType.LONG, now);
+        }
+        if (event instanceof EntityDamageByEntityEvent attack) {
+            Player player = attacker(attack);
+            if (player != null) encounter.rewards.record(player, Math.min(dragon.getHealth(), damage));
+        }
     }
 
     private EnderDragon enhancedDragonTarget(Entity target) {
         EnderDragon dragon = target instanceof EnderDragon main ? main
             : target instanceof ComplexEntityPart part && part.getParent() instanceof EnderDragon parent ? parent : null;
-        if (dragon == null || DragonRushCast.isDecoy(dragon) || dragon.isDead() || dragon.isInvulnerable()
+        if (dragon == null || DragonRushCast.isDecoy(dragon) || dragon.isDead() || dragon.getHealth() <= 0 || dragon.isInvulnerable()
             || dragon.getPhase() == EnderDragon.Phase.DYING || dragon.getWorld().getEnvironment() != World.Environment.THE_END) return null;
         DragonBattle battle = dragon.getWorld().getEnderDragonBattle();
-        return battle != null && dragon.equals(battle.getEnderDragon()) && (settings.includeFirst() || battle.hasBeenPreviouslyKilled())
+        return battle != null && dragon.equals(battle.getEnderDragon())
             ? dragon : null;
     }
 
@@ -394,24 +582,50 @@ public final class ALDragon extends JavaPlugin implements Listener {
     public void onDragonSpawn(CreatureSpawnEvent event) {
         if (!(event.getEntity() instanceof EnderDragon dragon) || DragonRushCast.isDecoy(dragon)
             || dragon.getWorld().getEnvironment() != World.Environment.THE_END) return;
-        Bukkit.getScheduler().runTask(this, () -> {
-            if (!dragon.isValid() || dragon.isDead()) return;
-            DragonBattle battle = dragon.getWorld().getEnderDragonBattle();
-            if (battle == null || !dragon.equals(battle.getEnderDragon())) return;
-            if (battle.hasBeenPreviouslyKilled() || settings.includeFirst()) initialize(dragon);
+        queueDragonRegistration(dragon, dragon.getWorld(), true, DRAGON_REGISTRATION_RETRIES, 1);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onEntitiesLoad(EntitiesLoadEvent event) {
+        World world = event.getWorld();
+        if (world.getEnvironment() != World.Environment.THE_END) return;
+        for (Entity entity : event.getEntities()) {
+            if (entity instanceof EnderDragon dragon && !DragonRushCast.isDecoy(dragon)) {
+                queueDragonRegistration(dragon, world, false, DRAGON_REGISTRATION_RETRIES, 1);
+            }
+        }
+    }
+
+    private void queueDragonRegistration(EnderDragon dragon, World world, boolean announce, int retries, long delay) {
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (dragon.isDead() || dragon.getWorld() != world || Bukkit.getWorld(world.getUID()) != world) return;
+            DragonBattle battle = world.getEnderDragonBattle();
+            if (!dragon.isValid() || battle == null || !dragon.equals(battle.getEnderDragon())) {
+                if (retries > 0) queueDragonRegistration(dragon, world, announce, retries - 1, DRAGON_RETRY_DELAY);
+                return;
+            }
+            watchWorld(world);
+            if (!announce) return;
+            Encounter encounter = initialize(dragon);
             Location center = battle.getEndPortalLocation();
             if (center == null) center = dragon.getPodium();
+            if (center != null && encounter.profile.id().equals("storm")) {
+                Settings combat = encounter.profile.combat();
+                double damage = combat.skills() ? combat.entranceStormDamage() * combat.tuning().damageScale() : 0;
+                LightningCast.playEntrance(this, dragon, center, damage);
+            }
             if (center == null) center = dragon.getLocation();
-            String health = BigDecimal.valueOf(multiplier(dragon, healthKey))
-                .setScale(2, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString();
-            showTitle(center, language.message("spawn-title", NamedTextColor.LIGHT_PURPLE),
-                Component.text(language.text("spawn-subtitle").replace("{multiplier}", health), NamedTextColor.WHITE));
-        });
+            showTitle(center, encounter.profile.combat().tuning(), language.message("spawn-title", NamedTextColor.LIGHT_PURPLE),
+                Component.text(language.text("profile-spawn-subtitle").replace("{dragon}", dragonName(encounter.profile))
+                    .replace("{max}", Integer.toString((int) Math.ceil(encounter.profile.combat().health()))), NamedTextColor.WHITE));
+        }, delay);
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onDragonDeath(EntityDeathEvent event) {
         if (!(event.getEntity() instanceof EnderDragon dragon) || dragon.isSilent()) return;
+        Encounter encounter = encounters.get(dragon.getWorld().getUID());
+        if (encounter == null || !encounter.dragon.equals(dragon.getUniqueId())) return;
         boolean playSound = event.shouldPlayDeathSound();
         Location origin = dragon.getLocation();
         event.setShouldPlayDeathSound(false);
@@ -422,7 +636,7 @@ public final class ALDragon extends JavaPlugin implements Listener {
                 return;
             }
             if (!playSound) return;
-            double radius = settings.tuning().soundRadius();
+            double radius = encounter.profile.combat().tuning().soundRadius();
             if (radius == 0) return;
             for (var player : origin.getNearbyPlayers(radius)) {
                 if (player.getLocation().distanceSquared(origin) <= radius * radius) {
@@ -432,48 +646,65 @@ public final class ALDragon extends JavaPlugin implements Listener {
         });
     }
 
-    private void showTitle(Location center, Component title, Component subtitle) {
-        double radius = settings.tuning().titleRadius();
-        int ticks = settings.tuning().titleTicks();
-        if (radius == 0 || ticks == 0) return;
-        Title message = Title.title(title, subtitle, settings.tuning().titleTimes());
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onDragonRemoved(EntityRemoveEvent event) {
+        if (event.getCause() != EntityRemoveEvent.Cause.DEATH || !(event.getEntity() instanceof EnderDragon dragon)) return;
+        Encounter encounter = encounters.get(dragon.getWorld().getUID());
+        if (encounter == null || !encounter.dragon.equals(dragon.getUniqueId()) || encounter.rewarded) return;
+        encounter.rewarded = true;
+        Bukkit.getScheduler().runTask(this, () -> encounter.rewards.distribute(this, language, encounter.profile));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onWorldLoad(WorldLoadEvent event) {
+        watchExistingDragon(event.getWorld());
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onWorldUnload(WorldUnloadEvent event) {
+        World world = event.getWorld();
+        if (world.getEnvironment() != World.Environment.THE_END) return;
+        unwatchWorld(world);
+        encounters.remove(world.getUID());
+        pendingSummons.remove(world.getUID());
+    }
+
+    private void showTitle(Location center, Settings.Tuning tuning, Component title, Component subtitle) {
+        double radius = tuning.titleRadius();
+        if (radius == 0 || tuning.titleTicks() == 0) return;
+        Title message = Title.title(title, subtitle, tuning.titleTimes());
         for (var player : center.getNearbyPlayers(radius)) {
             if (player.getLocation().distanceSquared(center) <= radius * radius) player.showTitle(message);
         }
     }
 
-    @EventHandler(priority = EventPriority.LOWEST)
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onEggRoll(DragonEggFormEvent event) {
-        DragonBattle battle = event.getDragonBattle();
-        if (!battle.hasBeenPreviouslyKilled()) return;
-        var data = event.getBlock().getWorld().getPersistentDataContainer();
-        int misses = data.getOrDefault(missesKey, PersistentDataType.INTEGER, 0);
-        EnderDragon dragon = battle.getEnderDragon();
-        boolean win = settings.wins(misses, multiplier(dragon, healthKey), multiplier(dragon, damageKey),
-            ThreadLocalRandom.current().nextDouble(100));
-        event.setCancelled(!win);
+        if (!event.getDragonBattle().hasBeenPreviouslyKilled()) return;
+        Encounter encounter = eggEncounter(event);
+        if (encounter != null && ThreadLocalRandom.current().nextDouble(100) >= encounter.profile.eggChance()) event.setCancelled(true);
+    }
+
+    private Encounter eggEncounter(DragonEggFormEvent event) {
+        Encounter encounter = encounters.get(event.getBlock().getWorld().getUID());
+        EnderDragon dragon = event.getDragonBattle().getEnderDragon();
+        return dragon == null || encounter != null && encounter.dragon.equals(dragon.getUniqueId()) ? encounter : null;
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onEggResult(DragonEggFormEvent event) {
-        boolean repeat = event.getDragonBattle().hasBeenPreviouslyKilled();
+        Encounter encounter = eggEncounter(event);
+        if (encounter == null) return;
         Block block = event.getBlock();
-        World world = block.getWorld();
-        if (!eggDecisions.add(world.getUID())) return;
+        UUID world = block.getWorld().getUID();
+        if (!eggDecisions.add(world)) return;
         boolean approved = !event.isCancelled() && event.getNewState().getType() == Material.DRAGON_EGG;
         Bukkit.getScheduler().runTask(this, () -> {
-            eggDecisions.remove(world.getUID());
+            eggDecisions.remove(world);
             boolean generated = approved && block.getType() == Material.DRAGON_EGG;
-            showTitle(block.getLocation().toCenterLocation(), language.message("death-title", NamedTextColor.LIGHT_PURPLE),
+            showTitle(block.getLocation().toCenterLocation(), encounter.profile.combat().tuning(),
+                language.message("death-title", NamedTextColor.LIGHT_PURPLE),
                 language.message(generated ? "egg-dropped" : "egg-missed", generated ? NamedTextColor.GREEN : NamedTextColor.GRAY));
-            if (!repeat) return;
-            var data = world.getPersistentDataContainer();
-            if (generated) {
-                data.set(missesKey, PersistentDataType.INTEGER, 0);
-            } else {
-                int misses = data.getOrDefault(missesKey, PersistentDataType.INTEGER, 0);
-                if (misses < Integer.MAX_VALUE) data.set(missesKey, PersistentDataType.INTEGER, misses + 1);
-            }
         });
     }
 }
