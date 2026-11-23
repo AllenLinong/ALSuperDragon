@@ -115,12 +115,9 @@ final class PodiumCrystal {
         for (Player player : victims()) {
             double distance = Math.sqrt(horizontalDistanceSquared(player.getLocation()));
             if (distance < previous || distance > waveRadius || !passed.add(player.getUniqueId())) continue;
-            if (blocksWave(player)) {
+            if (resolveBlast(player, center)) {
                 blocked.add(player.getUniqueId());
-                player.damage(player.getHealth() * .9, DamageSource.builder(DamageType.DRAGON_BREATH).build());
                 player.sendActionBar(language.message("podium-wave-shielded", NamedTextColor.GREEN));
-            } else if (settings.blastDamage() > 0) {
-                player.damage(settings.blastDamage(), DamageSource.builder(DamageType.DRAGON_BREATH).build());
             }
         }
     }
@@ -148,11 +145,20 @@ final class PodiumCrystal {
         }
     }
 
-    private boolean blocksWave(Player player) {
-        if (!player.isBlocking() || player.getActiveItem().getType() != Material.SHIELD) return false;
+    static boolean resolveBlast(Player player, Location source) {
+        if (!blocksBlast(player, source)) {
+            player.setHealth(0);
+            return false;
+        }
+        player.damage(player.getHealth() * .9, DamageSource.builder(DamageType.DRAGON_BREATH).build());
+        return true;
+    }
+
+    private static boolean blocksBlast(Player player, Location source) {
+        if (!player.isBlocking() || player.hasCooldown(Material.SHIELD) || player.getActiveItem().getType() != Material.SHIELD) return false;
         Location eyes = player.getEyeLocation();
         var facing = eyes.getDirection().setY(0);
-        var toward = center.toVector().subtract(eyes.toVector()).setY(0);
+        var toward = source.toVector().subtract(eyes.toVector()).setY(0);
         return toward.lengthSquared() < 1e-6 || (facing.lengthSquared() > 1e-6 && facing.normalize().dot(toward.normalize()) >= .5);
     }
 

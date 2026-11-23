@@ -13,7 +13,7 @@ ai:
 
 skills:
   enabled: true
-  interval-seconds: 10
+  interval-seconds: 7
   min-cast-gap-seconds: 5
   recovery-seconds: 2
   major-cooldown-seconds: 12
@@ -21,15 +21,21 @@ skills:
   fireball:
     enabled: true
     damage: 8.0
+    radius: 5.0
   shockwave:
     enabled: true
     damage: 6.0
   laser:
-    enabled: false
+    enabled: true
+    damage: 6.0
+    health-percent: 40
+    sweep-cooldown-seconds: 35
   dive:
     enabled: true
     damage: 8.0
     combo-count: 3
+    radius: 5.5
+    warning-seconds: 1.5
   dragon-rush:
     enabled: true
     damage: 6.0
@@ -43,13 +49,14 @@ skills:
     enabled: true
     damage: 1.25
   tracking-laser:
-    enabled: false
+    enabled: true
+    damage: 2.0
+    cooldown-seconds: 25
   ender-roar:
     enabled: true
     cooldown-seconds: 16
   podium-crystal:
     enabled: true
-    blast-damage: 28.0
     blast-radius: 32.0
   finale:
     enabled: true

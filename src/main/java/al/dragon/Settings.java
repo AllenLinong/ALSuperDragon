@@ -9,7 +9,7 @@ record Settings(double health, double damage, double maxDamagePerHitPercent, Idl
                 boolean skills, int intervalTicks, int majorRecoveryTicks, CastRhythm rhythm,
                 double fireball, double shockwave, double laser, double dive, double finale,
                 boolean crystals, boolean trail, int electricAuraTicks, double entranceStormDamage, int phantoms, String music, Tuning tuning, DragonRush rush, ExtraSkills extra,
-                PodiumCharge podiumCharge, CrystalRevival.Options crystalRevival, int aiChargeTicks) {
+                PodiumCharge podiumCharge, CrystalRevival.Options crystalRevival, int aiChargeTicks, int sweepCooldownTicks) {
     static Settings load(ConfigurationSection config) {
         return new Settings(number(config, "combat.health", 200, 1, 1024),
             number(config, "combat.damage-multiplier", 1, 0.1, 10),
@@ -30,7 +30,8 @@ record Settings(double health, double damage, double maxDamagePerHitPercent, Idl
             config.getBoolean("skills.music.enabled", false) ? config.getString("skills.music.sound", "minecraft:music.dragon") : "",
             Tuning.read(config), DragonRush.read(config), ExtraSkills.read(config), PodiumCharge.read(config), CrystalRevival.Options.read(config),
             config.getBoolean("ai.enabled", false)
-                ? (int) Math.round(number(config, "ai.charge-interval-seconds", 20, 8, 120) * 20) : 0);
+                ? (int) Math.round(number(config, "ai.charge-interval-seconds", 20, 8, 120) * 20) : 0,
+            CastRhythm.ticks(config, "skills.laser.sweep-cooldown-seconds", 25, 20, 3600));
     }
 
     private static double skill(ConfigurationSection config, String name, double fallback) {
@@ -90,7 +91,7 @@ record Settings(double health, double damage, double maxDamagePerHitPercent, Idl
 
     record TrackingBeam(AreaSkill skill, int durationTicks, double range) {
         private static TrackingBeam read(ConfigurationSection config) {
-            return new TrackingBeam(AreaSkill.read(config, "tracking-laser", 30, 30, 1, 2, 1),
+            return new TrackingBeam(AreaSkill.read(config, "tracking-laser", 30, 20, 1, 2, 1),
                 (int) Math.round(number(config, "skills.tracking-laser.duration-seconds", 5, 1, 15) * 20),
                 number(config, "skills.tracking-laser.range", 64, 8, 96));
         }
@@ -100,9 +101,9 @@ record Settings(double health, double damage, double maxDamagePerHitPercent, Idl
                        AreaSkill endCross, AreaSkill levitation, AreaSkill breath, AreaSkill crystal, AreaSkill voidRings, AreaSkill skyBite, double liftHeight,
                        TrackingBeam trackingLaser, boolean roarEnabled, double roarRange) {
         private static ExtraSkills read(ConfigurationSection config) {
-            return new ExtraSkills(AreaSkill.added(config, "thunder", 90, 22, 1.25, 5, 2.5),
-                AreaSkill.added(config, "thunderstorm", 45, 42, 1.25, 3, 2.1),
-                AreaSkill.added(config, "thunder-chain", 70, 30, 2.5, 5, 8),
+            return new ExtraSkills(AreaSkill.added(config, "thunder", 90, 12, 1.25, 5, 3),
+                AreaSkill.added(config, "thunderstorm", 45, 26, 1.25, 3, 2.75),
+                AreaSkill.added(config, "thunder-chain", 70, 20, 2.5, 5, 8),
                 AreaSkill.added(config, "rift-mark", 80, 24, 1.75, 3, 3.5),
                 AreaSkill.added(config, "gravity-well", 68, 36, 2.5, 6, 7),
                 AreaSkill.added(config, "end-cross", 45, 35, 1.6, 8, 8),
@@ -117,13 +118,12 @@ record Settings(double health, double damage, double maxDamagePerHitPercent, Idl
     }
 
     record PodiumCharge(boolean enabled, double health, int fuseTicks, double radius, double waveSpeed,
-                        double blastDamage, int breathTicks, double breathDamage) {
+                        int breathTicks, double breathDamage) {
         private static PodiumCharge read(ConfigurationSection config) {
             String path = "skills.podium-crystal.";
             return new PodiumCharge(config.getBoolean(path + "enabled", true), number(config, path + "health-percent", 55, 1, 100) / 100,
                 (int) Math.round(number(config, path + "wave-fuse-seconds", 10, 1, 30) * 20),
                 number(config, path + "blast-radius", 50, 1, 160), number(config, path + "wave-speed", .5, .1, 5),
-                number(config, path + "blast-damage", 99_999, 0, 99_999),
                 (int) Math.round(number(config, path + "breath-seconds", 20, 1, 120) * 20), number(config, path + "breath-damage", 2, 0, 100));
         }
     }

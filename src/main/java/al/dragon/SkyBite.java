@@ -21,6 +21,9 @@ final class SkyBite {
     private static final int CHARGE_LIMIT = 80;
     private static final int CARRY_LIMIT = 100;
     private static final double MAX_BITE_MARGIN = .5;
+    private static final double MOUTH_REACH = 1.6;
+    private static final double BODY_REACH = 10;
+    private static final double MAX_CARRY_SPEED = 2;
     private static final FlightAccess FLIGHT = FlightAccess.load();
     private final EnderDragon dragon;
     private final Player target;
@@ -30,11 +33,14 @@ final class SkyBite {
     private final double damage;
     private int age;
     private int heldTicks;
-    private Location held;
     private Vector holdOffset;
     private Location lastHead;
+    private Location lastBody;
     private boolean charging;
     private double grabY;
+    private int nextChargeRestart;
+    private Vector chargeDirection;
+    private Location carryTarget;
 
     SkyBite(EnderDragon dragon, Player target, Language language, Settings.ExtraSkills settings, double damageScale) {
         this.dragon = dragon;
@@ -54,7 +60,7 @@ final class SkyBite {
 
     boolean tick(List<Player> players) {
         if (!players.contains(target) || !target.isOnline() || target.isInsideVehicle() || !dragon.isValid() || dragon.isDead()
-            || dragon.getPhase() == EnderDragon.Phase.DYING || !dragon.getWorld().equals(target.getWorld())) return finish(held != null);
+            || dragon.getPhase() == EnderDragon.Phase.DYING || !dragon.getWorld().equals(target.getWorld())) return finish(holdOffset != null);
         if (++age <= skill.warningTicks()) {
             if (age % 4 == 1) markTarget();
             return false;
@@ -64,7 +70,7 @@ final class SkyBite {
             return fly();
         } catch (ReflectiveOperationException | RuntimeException exception) {
             Bukkit.getLogger().log(Level.WARNING, "ALSuperDragon could not steer the dragon for Sky Bite", exception);
-            return finish(held != null);
+            return finish(holdOffset != null);
         }
     }
 
@@ -89,21 +95,34 @@ final class SkyBite {
             if (!canReach(body, target) || !clearPath(head, torso)) return finish(false);
             Vector forward = horizontalDirection(torso.toVector().subtract(body.toVector()));
             if (forward == null) return finish(false);
-            dragon.setPhase(EnderDragon.Phase.CHARGE_PLAYER);
-            if (dragon.getPhase() != EnderDragon.Phase.CHARGE_PLAYER) return finish(false);
+            if (!restartNativeCharge(dragon, torso.clone().add(forward.clone().multiply(6)))) return finish(false);
             charging = true;
-            FLIGHT.aim(dragon, torso.clone().add(forward.multiply(6)));
+            chargeDirection = forward;
+            nextChargeRestart = age + 7;
             body.getWorld().playSound(body, Sound.ENTITY_ENDER_DRAGON_GROWL, 3, 1.15f);
             lastHead = head;
+            lastBody = body;
             return false;
         }
-        if (dragon.getPhase() != EnderDragon.Phase.CHARGE_PLAYER) return finish(held != null);
-        if (held != null) return lift(head, feet);
+        Vector updatedDirection = horizontalDirection(torso.toVector().subtract(body.toVector()));
+        if (holdOffset == null && updatedDirection != null) chargeDirection = updatedDirection;
+        Location chargeTarget = carryTarget == null
+            ? torso.clone().add(chargeDirection.clone().multiply(6)) : carryTarget;
+        if (dragon.getPhase() != EnderDragon.Phase.CHARGE_PLAYER || age >= nextChargeRestart) {
+            if (!restartNativeCharge(dragon, chargeTarget)) return finish(holdOffset != null);
+            nextChargeRestart = age + 7;
+        }
+        if (holdOffset != null) return lift(head, feet);
         if (age - skill.warningTicks() > CHARGE_LIMIT) return finish(false);
         Vector approach = head.toVector().subtract(lastHead.toVector());
         Vector toTarget = torso.toVector().subtract(lastHead.toVector());
+        boolean bodyApproaching = body.distanceSquared(lastBody) >= .01
+            && body.distanceSquared(torso) < lastBody.distanceSquared(torso);
         lastHead = head;
-        if (approach.lengthSquared() < .01 || approach.dot(toTarget) <= 0
+        lastBody = body;
+        if (!bodyApproaching || body.distanceSquared(torso) > BODY_REACH * BODY_REACH
+            || head.distanceSquared(torso) > MOUTH_REACH * MOUTH_REACH
+            || approach.lengthSquared() < .01 || approach.dot(toTarget) <= 0
             || !headBox.expand(Math.min(MAX_BITE_MARGIN, skill.radius())).overlaps(targetBox)
             || !clearPath(head, torso)) return false;
 
@@ -111,10 +130,10 @@ final class SkyBite {
         if (forward == null) forward = horizontalDirection(head.toVector().subtract(body.toVector()));
         if (forward == null) return finish(false);
         double climbY = Math.min(body.getWorld().getMaxHeight() - 3, body.getY() + height + 12);
-        Location climbTarget = body.clone().add(forward.multiply(32));
-        climbTarget.setY(climbY);
-        FLIGHT.aim(dragon, climbTarget);
-        held = feet;
+        carryTarget = body.clone().add(forward.multiply(32));
+        carryTarget.setY(climbY);
+        if (!restartNativeCharge(dragon, carryTarget)) return finish(false);
+        nextChargeRestart = age + 7;
         holdOffset = feet.toVector().subtract(head.toVector());
         grabY = feet.getY();
         head.getWorld().spawnParticle(Particle.CRIT, head, 16, .35, .3, .35, .15);
@@ -124,18 +143,21 @@ final class SkyBite {
     }
 
     private boolean lift(Location head, Location feet) {
-        if (++heldTicks > CARRY_LIMIT || feet.distanceSquared(held) > 9 || head.distanceSquared(lastHead) > 16) return finish(true);
+        if (++heldTicks > CARRY_LIMIT || feet.getY() - grabY >= height - .001) return finish(true);
+        Vector movement = head.toVector().subtract(lastHead.toVector());
+        if (movement.lengthSquared() > 16) return finish(true);
         lastHead = head;
-        Location passenger = head.clone().add(holdOffset);
-        passenger.setDirection(feet.getDirection());
-        if (!clearPath(feet.clone().add(0, .9, 0), passenger.clone().add(0, .9, 0))
-            || !DragonParticles.loaded(passenger.clone().add(0, 1.8, 0)) || target.collidesAt(passenger)
-            || !target.teleport(passenger)) return finish(true);
-        target.setVelocity(new Vector());
+        Location anchor = head.clone().add(holdOffset);
+        Vector correction = anchor.toVector().subtract(feet.toVector());
+        if (correction.lengthSquared() > 9) return finish(true);
+        Vector velocity = movement.add(correction.multiply(.55));
+        if (velocity.lengthSquared() > MAX_CARRY_SPEED * MAX_CARRY_SPEED) velocity.normalize().multiply(MAX_CARRY_SPEED);
+        Location next = feet.clone().add(velocity);
+        if (!clearPath(feet.clone().add(0, .9, 0), next.clone().add(0, .9, 0))
+            || !DragonParticles.loaded(next.clone().add(0, 1.8, 0)) || target.collidesAt(next)) return finish(true);
+        target.setVelocity(velocity);
         target.setFallDistance(0);
-        held = passenger;
         if (heldTicks % 10 == 0) DragonSkills.hurt(target, dragon, damage * .5);
-        if (held.getY() - grabY >= height - .001) return finish(true);
         return false;
     }
 
@@ -152,36 +174,68 @@ final class SkyBite {
     }
 
     void cancel() {
-        finish(held != null);
+        finish(holdOffset != null);
     }
 
     private boolean finish(boolean notify) {
-        if (charging && dragon.isValid() && !dragon.isDead() && dragon.getPhase() == EnderDragon.Phase.CHARGE_PLAYER) {
+        if (charging && dragon.isValid() && !dragon.isDead() && dragon.getPhase() != EnderDragon.Phase.DYING
+            && (dragon.getPhase() == EnderDragon.Phase.CHARGE_PLAYER || dragon.getPhase() == EnderDragon.Phase.HOVER)) {
             dragon.setPhase(EnderDragon.Phase.CIRCLING);
         }
         charging = false;
-        if (notify && held != null && target.isOnline() && !target.isDead()) {
+        chargeDirection = null;
+        carryTarget = null;
+        if (notify && holdOffset != null && target.isOnline() && !target.isDead()) {
+            if (lastHead.getWorld().equals(target.getWorld()) && target.getLocation().distanceSquared(lastHead) <= 16) {
+                Vector velocity = target.getVelocity();
+                if (velocity.getY() > 0) target.setVelocity(velocity.setY(0));
+            }
             target.sendActionBar(language.message("sky-bite-drop", NamedTextColor.GOLD));
             target.playSound(target.getLocation(), Sound.ENTITY_ENDER_DRAGON_FLAP, .8f, 1.25f);
         }
+        holdOffset = null;
         return true;
     }
 
-    static boolean tryNativeCharge(EnderDragon dragon, Location target) {
+    static boolean nativeChargeAvailable() {
+        return FLIGHT != null;
+    }
+
+    static boolean hitFlightObstacle(EnderDragon dragon) {
         if (FLIGHT == null) return false;
+        try {
+            Object handle = FLIGHT.handle().invoke(dragon);
+            return FLIGHT.inWall().getBoolean(handle) || FLIGHT.horizontalCollision().getBoolean(handle)
+                || FLIGHT.verticalCollision().getBoolean(handle);
+        } catch (ReflectiveOperationException exception) {
+            return false;
+        }
+    }
+
+    static boolean tryNativeCharge(EnderDragon dragon, Location target) {
+        return restartNativeCharge(dragon, target);
+    }
+
+    static boolean restartNativeCharge(EnderDragon dragon, Location target) {
+        if (FLIGHT == null) return false;
+        if (dragon.getPhase() == EnderDragon.Phase.CHARGE_PLAYER) {
+            dragon.setPhase(EnderDragon.Phase.HOVER);
+            if (dragon.getPhase() != EnderDragon.Phase.HOVER) return false;
+        }
         dragon.setPhase(EnderDragon.Phase.CHARGE_PLAYER);
         if (dragon.getPhase() != EnderDragon.Phase.CHARGE_PLAYER) return false;
         try {
             FLIGHT.aim(dragon, target);
             return true;
         } catch (ReflectiveOperationException exception) {
-            dragon.setPhase(EnderDragon.Phase.CIRCLING);
+            dragon.setPhase(EnderDragon.Phase.HOVER);
             return false;
         }
     }
 
     private record FlightAccess(Method handle, Field headPart, Method bukkitPart, Method phaseManager,
-                                Method currentPhase, Method setTarget, Constructor<?> position) {
+                                Method currentPhase, Method setTarget, Constructor<?> position,
+                                Field inWall, Field horizontalCollision, Field verticalCollision) {
         static FlightAccess load() {
             try {
                 Class<?> craft = Class.forName("org.bukkit.craftbukkit.entity.CraftEnderDragon");
@@ -192,7 +246,8 @@ final class SkyBite {
                 Method manager = nms.getMethod("getPhaseManager");
                 return new FlightAccess(craft.getMethod("getHandle"), head, head.getType().getMethod("getBukkitEntity"), manager,
                     manager.getReturnType().getMethod("getCurrentPhase"), charge.getMethod("setTarget", vector),
-                    vector.getConstructor(double.class, double.class, double.class));
+                    vector.getConstructor(double.class, double.class, double.class), nms.getField("inWall"),
+                    nms.getField("horizontalCollision"), nms.getField("verticalCollision"));
             } catch (ReflectiveOperationException | LinkageError exception) {
                 Bukkit.getLogger().log(Level.WARNING, "ALSuperDragon native dragon charging unavailable (Sky Bite and proactive AI)", exception);
                 return null;

@@ -21,10 +21,11 @@ final class LightningCast {
     static final int WAVE_COUNT = 5;
     static final int BOLTS_PER_WAVE = 6;
     static final int BOLTS_PER_TICK = 2;
-    private static final int BOLT_GAP = 4;
-    private static final int WAVE_PAUSE = 8;
+    private static final int BOLT_GAP = 3;
+    private static final int WAVE_PAUSE = 5;
     private static final double FIELD_RADIUS = 13;
     private static final int ENTRANCE_DURATION = 60;
+    private static final int ENTRANCE_BOLT_GAP = 4;
     private static final double ENTRANCE_RADIUS = 5;
     private static final double ENTRANCE_HIT_RADIUS = 2.1;
 
@@ -62,7 +63,7 @@ final class LightningCast {
                     double distance = ENTRANCE_RADIUS * Math.sqrt(random.nextDouble());
                     Location spot = center.clone().add(Math.cos(angle) * distance, 0, Math.sin(angle) * distance);
                     if (!DragonParticles.loaded(spot)) continue;
-                    Location impact = ground(spot);
+                    Location impact = ground(spot, 4);
                     if (world.strikeLightningEffect(impact).isValid()) impacts[impactCount++] = impact;
                 }
                 if (damage > 0 && impactCount > 0) {
@@ -83,20 +84,22 @@ final class LightningCast {
                         }
                     }
                 }
-                if ((elapsed += BOLT_GAP) >= ENTRANCE_DURATION) cancel();
+                if ((elapsed += ENTRANCE_BOLT_GAP) >= ENTRANCE_DURATION) cancel();
             }
-        }.runTaskTimer(plugin, 1, BOLT_GAP);
+        }.runTaskTimer(plugin, 1, ENTRANCE_BOLT_GAP);
     }
 
     boolean tick(EnderDragon dragon, List<Player> players, Settings.AreaSkill skill, double scale) {
         if (spots == null) {
-            spots = planWave();
+            spots = planWave(players);
             center.getWorld().playSound(center, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, .9f, storm ? .8f : 1.4f);
         }
         if (tick < skill.warningTicks()) {
             if (tick % 5 == 0) for (Location spot : spots) {
-                DragonSkills.ring(spot, skill.radius(), storm ? 10 : 20, DragonSkills.THUNDER_WARNING);
-                spot.getWorld().spawnParticle(Particle.ELECTRIC_SPARK, spot.clone().add(0, .4, 0), 3, .12, .3, .12, .04);
+                var audience = DragonParticles.warningViewers(spot, 48);
+                DragonSkills.warningRing(spot, skill.radius(), storm ? 14 : 24, DragonSkills.THUNDER_WARNING, audience);
+                if (!audience.isEmpty()) spot.getWorld().spawnParticle(Particle.ELECTRIC_SPARK, audience, null,
+                    spot.getX(), spot.getY() + .55, spot.getZ(), 3, .08, .35, .08, .035, null, true);
             }
         } else if ((tick - skill.warningTicks()) % BOLT_GAP == 0 && next < spots.size()) {
             List<Location> resolved = new ArrayList<>(BOLTS_PER_TICK);
@@ -115,7 +118,7 @@ final class LightningCast {
                 if (hit.contains(player.getUniqueId())) continue;
                 Location position = player.getLocation();
                 for (Location spot : resolved) {
-                    if (Math.abs(position.getY() - spot.getY()) <= 3
+                    if (Math.abs(position.getY() - spot.getY()) <= 4
                         && DragonSkills.horizontalDistanceSquared(position, spot) <= skill.radius() * skill.radius()) {
                         hit.add(player.getUniqueId());
                         DragonSkills.hurt(player, dragon, skill.damage() * scale);
@@ -134,27 +137,39 @@ final class LightningCast {
         return false;
     }
 
-    private List<Location> planWave() {
-        if (!storm) return DragonParticles.loaded(center) ? List.of(ground(center)) : List.of();
+    private List<Location> planWave(List<Player> players) {
+        if (!storm) return DragonParticles.loaded(center) ? List.of(ground(center, .5)) : List.of();
         var random = ThreadLocalRandom.current();
         List<Location> planned = new ArrayList<>(BOLTS_PER_WAVE);
+        Location closest = null;
+        double best = FIELD_RADIUS * FIELD_RADIUS;
+        for (Player player : players) {
+            Location position = player.getLocation();
+            double distance = DragonSkills.horizontalDistanceSquared(position, center);
+            if (distance <= best && DragonParticles.loaded(position)) {
+                closest = position;
+                best = distance;
+            }
+        }
+        if (closest != null) planned.add(ground(closest, .5));
         double rotation = random.nextDouble(Math.TAU);
-        for (int index = 0; index < BOLTS_PER_WAVE; index++) {
+        int randomBolts = BOLTS_PER_WAVE - planned.size();
+        for (int index = 0; index < randomBolts; index++) {
             for (int attempt = 0; attempt < 3; attempt++) {
-                double angle = rotation + (index + random.nextDouble()) * Math.TAU / BOLTS_PER_WAVE;
+                double angle = rotation + (index + random.nextDouble()) * Math.TAU / randomBolts;
                 double distance = index % 2 == 0 ? random.nextDouble(1.5, 7) : random.nextDouble(7, FIELD_RADIUS);
                 Location spot = center.clone().add(Math.cos(angle) * distance, 0, Math.sin(angle) * distance);
                 if (!DragonParticles.loaded(spot)) continue;
-                planned.add(ground(spot));
+                planned.add(ground(spot, 4));
                 break;
             }
         }
         return planned;
     }
 
-    private static Location ground(Location spot) {
+    private static Location ground(Location spot, double startAbove) {
         Location top = spot.clone();
-        top.setY(Math.min(spot.getWorld().getMaxHeight() - .5, spot.getY() + 4));
+        top.setY(Math.min(spot.getWorld().getMaxHeight() - .5, spot.getY() + startAbove));
         var ground = spot.getWorld().rayTraceBlocks(top, new Vector(0, -1, 0), 12, FluidCollisionMode.NEVER, true);
         return ground == null ? spot : ground.getHitPosition().toLocation(spot.getWorld()).add(0, .08, 0);
     }

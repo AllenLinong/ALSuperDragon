@@ -1,6 +1,7 @@
 package al.dragon;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -24,9 +25,9 @@ import org.bukkit.boss.DragonBattle;
 import org.bukkit.damage.DamageSource;
 import org.bukkit.damage.DamageType;
 import org.bukkit.entity.AreaEffectCloud;
-import org.bukkit.entity.DragonFireball;
 import org.bukkit.entity.EnderCrystal;
 import org.bukkit.entity.EnderDragon;
+import org.bukkit.entity.DragonFireball;
 import org.bukkit.entity.Enderman;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.LivingEntity;
@@ -44,6 +45,13 @@ final class DragonSkills {
     private static final int STEP = 1;
     private static final MinorSkill[] MINOR_ORDER = MinorSkill.values();
     private static final double RANGED_CAST_RANGE = 64;
+    private static final int CHARGE_WARNING_TICKS = 28;
+    private static final int NATIVE_CHARGE_REFRESH_TICKS = 7;
+    private static final int CHARGE_RETRY_TICKS = 40;
+    private static final int CHARGE_STUN_TICKS = 100;
+    private static final double CHARGE_MAX_RANGE = 56;
+    private static final int LASER_FLIGHT_TIMEOUT = 120;
+    private static final int LASER_RETRY_TICKS = 100;
     private static final NamespacedKey RUSH_REACHED = ALDragon.storedKey("rush_reached");
     private static final NamespacedKey RUSH_CASTS = ALDragon.storedKey("rush_casts");
     private static final NamespacedKey ROAR_REACHED = ALDragon.storedKey("roar_reached");
@@ -51,6 +59,14 @@ final class DragonSkills {
     private static final NamespacedKey PODIUM_CRYSTAL_USED = ALDragon.storedKey("podium_crystal_used");
     private static final NamespacedKey PODIUM_CRYSTAL_REACHED = ALDragon.storedKey("podium_crystal_reached");
     private static final Particle.DustOptions WARNING = new Particle.DustOptions(Color.fromRGB(225, 86, 246), 1.2f);
+    private static final Particle.DustOptions FIREBALL_WARNING = new Particle.DustOptions(Color.fromRGB(255, 173, 53), 1.3f);
+    private static final Particle.DustOptions DIVE_WARNING = new Particle.DustOptions(Color.fromRGB(255, 84, 67), 1.3f);
+    private static final Particle.DustOptions CHARGE_WARNING = new Particle.DustOptions(Color.fromRGB(255, 45, 45), 2f);
+    private static final Particle.DustOptions CROSS_WARNING = new Particle.DustOptions(Color.fromRGB(255, 75, 65), 1.65f);
+    private static final Particle.DustOptions CROSS_IMPACT = new Particle.DustOptions(Color.fromRGB(255, 202, 112), 1.8f);
+    private static final Particle.DustOptions PULL_WARNING = new Particle.DustOptions(Color.fromRGB(184, 114, 255), 1.45f);
+    private static final Particle.DustOptions LASER_WARNING = new Particle.DustOptions(Color.fromRGB(92, 226, 255), 1.15f);
+    private static final Particle.DustOptions LASER_LOCKED = new Particle.DustOptions(Color.fromRGB(202, 253, 255), 1.5f);
     static final Particle.DustOptions THUNDER_WARNING = new Particle.DustOptions(Color.fromRGB(255, 220, 82), 1.1f);
     private static final Particle.DustOptions CHAIN_BLUE = new Particle.DustOptions(Color.fromRGB(62, 162, 255), 1.1f);
     private static final Particle.DustOptions CHAIN_WHITE = new Particle.DustOptions(Color.fromRGB(224, 247, 255), .9f);
@@ -98,19 +114,55 @@ final class DragonSkills {
 
     boolean controlsDragonMovement(EnderDragon dragon) {
         Fight fight = fights.get(dragon.getUniqueId());
-        return fight != null && (fight.bite != null || fight.trackingLaser != null
-            || fight.phase == CombatPhase.DIVE || fight.phase == CombatPhase.LASER);
+        return fight != null && (fight.bite != null || fight.trackingLaser != null || fight.laserApproach != null
+            || fight.chargeWarning != null || fight.aiChargeUntil > 0 || fight.chargeStunUntil > 0
+            || fight.phase == CombatPhase.DIVE || fight.phase == CombatPhase.LASER
+            || fight.cast != null && fight.cast.flightControlled);
     }
+
+    boolean isChargeStunned(EnderDragon dragon) {
+        Fight fight = fights.get(dragon.getUniqueId());
+        return fight != null && (fight.chargeStunUntil > 0 || fight.chargeBlocked != null);
+    }
+
+    boolean allowsPhaseChange(EnderDragon dragon, EnderDragon.Phase requested) {
+        Fight fight = fights.get(dragon.getUniqueId());
+        if (fight == null || !fight.controlsFlightPhase() || fight.pluginPhaseChange) return true;
+        return requested == EnderDragon.Phase.DYING;
+    }
+
+    boolean replaceVanillaFireball(com.destroystokyo.paper.event.entity.EnderDragonShootFireballEvent event) {
+        EnderDragon dragon = event.getEntity();
+        Fight fight = fights.get(dragon.getUniqueId());
+        if (fight == null || fight.idle || fight.settings.fireball() < 0 || dragon.isInvulnerable()
+            || dragon.getPhase() == EnderDragon.Phase.DYING) return false;
+        event.setCancelled(true);
+        launchUltra(fight, new DragonParticles(dragon.getWorld().getPlayers()), dragon.getLocation().add(0, 1.5, 0), false, false);
+        beginRegularCast(fight, (int) Math.round(fight.settings.intervalTicks() * fight.settings.tuning().cooldownScale()));
+        return true;
+    }
+
+    void blockAiCharge(EnderDragon dragon, ChargeBlock reason) {
+        Fight fight = fights.get(dragon.getUniqueId());
+        if (fight != null && fight.aiChargeUntil > fight.age && fight.chargeBlocked == null
+            && dragon.getPhase() == EnderDragon.Phase.CHARGE_PLAYER) {
+            fight.chargeBlocked = reason;
+        }
+    }
+
+    enum ChargeBlock { SHIELD, WALL }
 
     boolean isUsingSkyBite(EnderDragon dragon) {
         Fight fight = fights.get(dragon.getUniqueId());
         return fight != null && fight.bite != null;
     }
 
-    void tick(EnderDragon dragon, DragonBattle battle, Settings settings) {
+    void tick(EnderDragon dragon, DragonBattle battle, DragonProfiles.Profile profile) {
+        Settings settings = profile.combat();
         if (!settings.skills()) return;
         UUID id = dragon.getUniqueId();
         Fight existing = fights.get(id);
+        if (existing != null && tickChargeStun(existing)) return;
         if ((existing == null || existing.idle) && dragon.getTicksLived() % 10 != 0) return;
         var maxHealth = dragon.getAttribute(Attribute.MAX_HEALTH);
         double remaining = maxHealth == null ? 1 : dragon.getHealth() / maxHealth.getValue();
@@ -164,16 +216,10 @@ final class DragonSkills {
             }
             return;
         }
-        Fight fight = fights.computeIfAbsent(id, ignored -> new Fight(dragon, settings, interval));
+        Fight fight = fights.computeIfAbsent(id, ignored -> new Fight(dragon, profile, interval));
         fight.idle = false;
         fight.age += STEP;
         DragonParticles particles = new DragonParticles(viewers);
-        int auraInterval = settings.electricAuraTicks();
-        if (auraInterval > 0) {
-            if (fight.age % auraInterval == STEP) particles.electricAura(dragon.getLocation(), fight.age);
-        } else if (settings.trail() && fight.age % 3 == STEP) {
-            particles.trail(dragon.getLocation().add(0, 2.5, 0));
-        }
         fight.fireballs.removeIf(shot -> shot.tick(fight, particles));
         fight.mirrorDragons.removeIf(mirror -> mirror.tick(fight, particles));
         fight.waves.removeIf(wave -> wave.tick(dragon, particles, settings));
@@ -201,6 +247,7 @@ final class DragonSkills {
         }
         var crystal = podiumCrystals.get(id);
         if (crystal != null && crystal.isResolving()) {
+            fight.cancelAiChargeWarning();
             fight.podiumActive = true;
             return;
         }
@@ -216,15 +263,26 @@ final class DragonSkills {
             return;
         }
         if (fight.bite != null) {
-            if (fight.bite.tick(players)) {
-                fight.bite = null;
-                recover(fight, settings.rhythm().recovery());
+            fight.pluginPhaseChange = true;
+            try {
+                if (fight.bite.tick(players)) {
+                    fight.bite = null;
+                    recover(fight, settings.rhythm().recovery());
+                }
+            } finally {
+                fight.pluginPhaseChange = false;
             }
             return;
         }
+        if (fight.laserApproach != null) {
+            tickLaserApproach(fight, players);
+            return;
+        }
         if (fight.trackingLaser != null) {
-            if (fight.trackingLaser.tick(players, particles)) {
+            if (!holdLaserStation(fight, fight.laserPose) || fight.trackingLaser.tick(players, particles)) {
+                fight.releaseLaserFlight();
                 fight.trackingLaser = null;
+                fight.laserPose = null;
                 recover(fight, settings.rhythm().recovery());
             }
             return;
@@ -245,17 +303,35 @@ final class DragonSkills {
             return;
         }
         if (fight.cast != null) {
-            if (fight.cast.tick(dragon, players, settings, fight.breathClouds)) {
+            if (fight.cast.attack == Attack.LASER) {
+                if (dragon.getPhase() != EnderDragon.Phase.HOVER) fight.requestPhase(EnderDragon.Phase.HOVER);
+                if (dragon.getVelocity().lengthSquared() > .01) dragon.setVelocity(new Vector());
+            }
+            if (fight.cast.tick(fight, players, settings, fight.breathClouds, language)) {
+                if (fight.cast.attack == Attack.DIVE) fight.lastAttackTarget = fight.cast.regularTarget;
+                fight.releaseCastFlight();
                 recover(fight, fight.cast.attack.isMajor() ? settings.majorRecoveryTicks() : settings.rhythm().recovery());
                 fight.cast = null;
             }
             return;
         }
         if (fight.aiChargeUntil > 0) {
-            if (dragon.getPhase() == EnderDragon.Phase.CHARGE_PLAYER && fight.age < fight.aiChargeUntil) return;
-            fight.endAiCharge();
-            recover(fight, settings.rhythm().recovery());
+            if (dragon.getPhase() == EnderDragon.Phase.CHARGE_PLAYER && fight.age < fight.aiChargeUntil) {
+                if (fight.age >= fight.nextAiChargeReaim && fight.aiChargeTarget != null) {
+                    if (fight.maintainNativeCharge(fight.aiChargeTarget)) {
+                        fight.nextAiChargeReaim = fight.age + NATIVE_CHARGE_REFRESH_TICKS;
+                    } else {
+                        fight.endAiCharge();
+                        recover(fight, settings.rhythm().recovery());
+                    }
+                }
+                if (fight.aiChargeUntil > 0) return;
+            } else {
+                fight.endAiCharge();
+                recover(fight, settings.rhythm().recovery());
+            }
         }
+        if (fight.chargeWarning != null && tickAiChargeWarning(fight, players)) return;
         if (fight.age < fight.nextCast) return;
 
         if (fight.age >= fight.nextMajorCast) {
@@ -291,15 +367,14 @@ final class DragonSkills {
                     return;
                 }
             }
+            if (startDatapackPhase(fight, players, remaining, center)) {
+                if (fight.laserApproach == null) beginMajorCast(fight);
+                return;
+            }
             if (rushPending) {
                 fight.rush = new DragonRushCast(dragon, players, language, rush, tuning, rushCasts);
                 data.set(RUSH_CASTS, PersistentDataType.INTEGER, rushCasts + 1);
                 beginMajorCast(fight);
-                return;
-            }
-            if (startDatapackPhase(fight, players, remaining)) {
-                beginMajorCast(fight);
-                fight.nextRegularCast = Math.max(fight.nextRegularCast, fight.age + interval);
                 return;
             }
             int roarCasts = data.getOrDefault(ROAR_CASTS, PersistentDataType.INTEGER, 0);
@@ -331,82 +406,168 @@ final class DragonSkills {
                 recover(fight, settings.majorRecoveryTicks());
                 return;
             }
-            if (startMinorSkill(fight, players, remaining, true)) return;
+            if (startMinorSkill(fight, players, remaining, true, center)) return;
         }
         boolean regularTried = false;
         if (fight.preferRegular && fight.age >= fight.nextRegularCast) {
             regularTried = true;
-            if (tryRegularSkill(dragon, fight, players, remaining, interval, particles)) return;
+            if (tryRegularSkill(dragon, fight, players, remaining, interval)) return;
         }
-        if (startMinorSkill(fight, players, remaining, false)) {
+        if (startMinorSkill(fight, players, remaining, false, center)) {
             fight.preferRegular = true;
             return;
         }
         if (!regularTried && fight.age >= fight.nextRegularCast
-            && tryRegularSkill(dragon, fight, players, remaining, interval, particles)) return;
+            && tryRegularSkill(dragon, fight, players, remaining, interval)) return;
         tryAiCharge(fight, players);
     }
 
     private boolean tryRegularSkill(EnderDragon dragon, Fight fight, List<Player> players, double remaining,
-                                    int interval, DragonParticles particles) {
+                                    int interval) {
         var settings = fight.settings;
         var tuning = settings.tuning();
-        if (settings.fireball() >= 0 && replaceVanillaFireball(fight, particles)) {
-            beginRegularCast(fight, interval);
-            return true;
-        }
-        List<Attack> options = new ArrayList<>(4);
         Location origin = dragon.getLocation().add(0, 2, 0);
-        var nearby = players.stream().filter(player -> inRange(origin, player.getEyeLocation(), RANGED_CAST_RANGE)).toList();
-        var waveTargets = nearby.stream().filter(player -> Math.abs(player.getLocation().getY() - origin.getY()) <= 8).toList();
-        if (settings.shockwave() >= 0 && !waveTargets.isEmpty()) options.add(Attack.SHOCKWAVE);
-        if (settings.dive() >= 0 && !nearby.isEmpty()) options.add(Attack.DIVE);
-        boolean fireballReady = settings.fireball() >= 0 && remaining <= tuning.fireballHp();
+        List<Player> nearby = new ArrayList<>();
+        for (Player player : players) {
+            if (inRange(origin, player.getEyeLocation(), RANGED_CAST_RANGE)) nearby.add(player);
+        }
+        boolean fireballReady = settings.fireball() >= 0
+            && (remaining <= tuning.fireballHp() || (settings.shockwave() < 0 && settings.dive() < 0));
         boolean laserReady = settings.laser() >= 0 && remaining <= tuning.laserHp();
-        var visible = fireballReady || laserReady
-            ? nearby.stream().filter(player -> clearCastPath(origin, player.getEyeLocation(), RANGED_CAST_RANGE)).toList()
-            : List.<Player>of();
-        if (!visible.isEmpty() && fireballReady) options.add(Attack.FIREBALL);
-        if (!visible.isEmpty() && laserReady) options.add(Attack.LASER);
-        if (options.isEmpty()) {
+        Attack attack = null;
+        Player target = null;
+        var rotation = fight.regularStyle.rotation;
+        int checked = 0;
+        for (int offset = 0; !nearby.isEmpty() && offset < rotation.size(); offset++) {
+            int index = (fight.regularCursor + offset) % rotation.size();
+            Attack candidate = rotation.get(index);
+            int bit = 1 << candidate.ordinal();
+            if ((checked & bit) != 0) continue;
+            checked |= bit;
+            target = switch (candidate) {
+                case FIREBALL -> fireballReady ? rangedTarget(fight, nearby, origin, candidate) : null;
+                case LASER -> laserReady ? rangedTarget(fight, nearby, origin, candidate) : null;
+                case SHOCKWAVE -> {
+                    if (settings.shockwave() < 0) yield null;
+                    if (fight.regularStyle == RegularStyle.SCOUT) yield scoutWaveTarget(nearby, origin);
+                    var targets = nearby.stream()
+                        .filter(player -> Math.abs(player.getLocation().getY() - origin.getY()) <= 8).toList();
+                    yield targets.isEmpty() ? null : fight.regularStyle.target(targets, origin, fight.lastAttackTarget);
+                }
+                case DIVE -> {
+                    var diveTargets = nearby.stream()
+                        .filter(player -> clearCastPath(origin, player.getEyeLocation(), RANGED_CAST_RANGE)).toList();
+                    yield settings.dive() < 0 || !SkyBite.nativeChargeAvailable() || diveTargets.isEmpty() ? null
+                        : fight.regularStyle.target(diveTargets, origin, fight.lastAttackTarget);
+                }
+                default -> throw new IllegalStateException("Unexpected regular attack: " + candidate);
+            };
+            if (target != null) {
+                attack = candidate;
+                fight.regularCursor = (index + 1) % rotation.size();
+                break;
+            }
+        }
+        if (target == null) {
             fight.nextRegularCast = fight.age + 20;
             return false;
         }
-        if (options.size() > 1) options.remove(fight.lastRegularAttack);
         beginRegularCast(fight, interval);
-        var random = ThreadLocalRandom.current();
-        Attack attack = options.contains(Attack.LASER) && !fight.usedLaser ? Attack.LASER
-            : options.contains(Attack.FIREBALL) && !fight.usedFireball ? Attack.FIREBALL
-            : remaining <= tuning.diveHp() && options.contains(Attack.DIVE) && !fight.usedDive ? Attack.DIVE
-            : options.get(random.nextInt(options.size()));
-        fight.lastRegularAttack = attack;
-        if (attack == Attack.LASER) fight.usedLaser = true;
-        if (attack == Attack.FIREBALL) fight.usedFireball = true;
-        if (attack == Attack.DIVE && remaining <= tuning.diveHp()) fight.usedDive = true;
-        var targets = switch (attack) {
-            case FIREBALL, LASER -> visible;
-            case SHOCKWAVE -> waveTargets;
-            default -> nearby;
-        };
-        Player target = targets.get(random.nextInt(targets.size()));
-        Location aim = attack == Attack.LASER ? target.getEyeLocation() : target.getLocation().add(0, 0.15, 0);
-        Vector aimVector = aim.toVector().subtract(origin.toVector());
-        if (attack == Attack.LASER && aimVector.lengthSquared() >= 1.0e-6) {
-            aim = aim.add(aimVector.normalize().multiply(4));
+        fight.lastAttackTarget = target.getUniqueId();
+        Location aim = target.getLocation().add(0, attack == Attack.LASER ? .9 : .15, 0);
+        if (attack == Attack.DIVE && fight.regularStyle == RegularStyle.STORM) aim = stormDiveAim(origin, aim, target);
+        if (attack == Attack.LASER) {
+            Vector aimVector = aim.toVector().subtract(origin.toVector());
+            if (aimVector.lengthSquared() >= 1.0e-6) aim.add(aimVector.normalize().multiply(4));
         }
         if (attack == Attack.FIREBALL || attack == Attack.LASER) aim = clip(origin, aim);
         fight.cast = new Cast(attack, origin, aim);
+        fight.cast.regularStyle = fight.regularStyle;
+        fight.cast.regularTarget = target.getUniqueId();
+        if (attack == Attack.LASER) {
+            fight.cast.flightControlled = true;
+            fight.requestPhase(EnderDragon.Phase.HOVER);
+            dragon.setVelocity(new Vector());
+        }
         if (attack == Attack.DIVE) fight.cast.dives = remaining <= tuning.diveHp() ? tuning.diveCount() : 1;
+        String warning = switch (attack) {
+            case SHOCKWAVE -> fight.regularStyle == RegularStyle.SCOUT ? "scout-gap-warning" : "regular-shockwave-warning";
+            case FIREBALL -> "regular-fireball-warning";
+            case DIVE -> fight.regularStyle == RegularStyle.STORM ? "storm-breath-strike-warning"
+                : fight.cast.dives > 1 ? "breath-strike-combo-warning" : "breath-strike-warning";
+            case LASER -> fight.regularStyle == RegularStyle.ABYSS ? "abyss-focus-warning" : "regular-laser-warning";
+            default -> throw new IllegalStateException("Unexpected regular attack: " + attack);
+        };
+        target.sendActionBar(language.message(warning, NamedTextColor.GOLD));
         aim.getWorld().playSound(aim, Sound.ENTITY_ENDER_DRAGON_GROWL, 1.2f, 1.35f);
         return true;
+    }
+
+    private static Player scoutWaveTarget(List<Player> nearby, Location origin) {
+        Player target = null;
+        double closest = Double.POSITIVE_INFINITY;
+        for (Player player : nearby) {
+            Location feet = player.getLocation();
+            if (Math.abs(feet.getY() - origin.getY()) > 8) continue;
+            double distance = horizontalDistanceSquared(feet, origin);
+            if (distance < closest) {
+                closest = distance;
+                target = player;
+            }
+        }
+        return target;
+    }
+
+    private static Player rangedTarget(Fight fight, List<Player> nearby, Location origin, Attack attack) {
+        if (fight.regularStyle == RegularStyle.SCOUT) {
+            Player closest = null;
+            double best = Double.POSITIVE_INFINITY;
+            for (Player player : nearby) {
+                Location feet = player.getLocation();
+                double distance = feet.distanceSquared(origin);
+                if (distance >= best) continue;
+                Location point = attack == Attack.FIREBALL ? player.getEyeLocation() : feet.add(0, .9, 0);
+                if (clearCastPath(origin, point, RANGED_CAST_RANGE)) {
+                    closest = player;
+                    best = distance;
+                }
+            }
+            return closest;
+        }
+        boolean switchTarget = fight.regularStyle == RegularStyle.STORM || fight.regularStyle == RegularStyle.SOVEREIGN;
+        Player previous = null;
+        var random = ThreadLocalRandom.current();
+        for (int remaining = nearby.size(); remaining > 0; remaining--) {
+            int index = random.nextInt(remaining);
+            Player player = nearby.get(index);
+            if (index != remaining - 1) Collections.swap(nearby, index, remaining - 1);
+            if (switchTarget && player.getUniqueId().equals(fight.lastAttackTarget)) {
+                previous = player;
+                continue;
+            }
+            if (hasRegularCastPath(origin, player, attack)) return player;
+        }
+        return previous != null && hasRegularCastPath(origin, previous, attack) ? previous : null;
+    }
+
+    private static boolean hasRegularCastPath(Location origin, Player player, Attack attack) {
+        Location point = attack == Attack.FIREBALL ? player.getEyeLocation() : player.getLocation().add(0, .9, 0);
+        return clearCastPath(origin, point, RANGED_CAST_RANGE);
+    }
+
+    private static Location stormDiveAim(Location origin, Location aim, Player target) {
+        Vector lead = target.getVelocity().setY(0).multiply(7);
+        if (lead.lengthSquared() > 9) lead.normalize().multiply(3);
+        Location predicted = aim.clone().add(lead);
+        return inRange(origin, predicted, RANGED_CAST_RANGE) ? predicted : aim;
     }
 
     private void tryAiCharge(Fight fight, List<Player> players) {
         int cooldown = fight.settings.aiChargeTicks();
         EnderDragon dragon = fight.dragon;
-        if (cooldown == 0 || fight.age < fight.nextAiCheck || dragon.getPhase() != EnderDragon.Phase.CIRCLING
+        if (cooldown == 0 || !SkyBite.nativeChargeAvailable() || fight.age < fight.nextAiCheck || dragon.getPhase() != EnderDragon.Phase.CIRCLING
             || dragon.isInvulnerable()) return;
-        fight.nextAiCheck = fight.age + 40;
+        fight.nextAiCheck = fight.age + CHARGE_RETRY_TICKS;
         Location origin = dragon.getLocation().add(0, 2, 0);
         Player target = null;
         Location aim = null;
@@ -414,34 +575,112 @@ final class DragonSkills {
         for (Player player : players) {
             Location spot = player.getLocation().add(0, 1, 0);
             double distance = spot.distanceSquared(origin);
-            if (distance < 18 * 18 || distance > 56 * 56) continue;
-            double priority = distance + (player.getUniqueId().equals(fight.lastAiTarget) ? 56 * 56 : 0);
-            if (priority >= best || !clearCastPath(origin, spot, 56)) continue;
+            if (distance < 18 * 18 || distance > CHARGE_MAX_RANGE * CHARGE_MAX_RANGE) continue;
+            double priority = distance + (player.getUniqueId().equals(fight.lastAttackTarget) ? CHARGE_MAX_RANGE * CHARGE_MAX_RANGE : 0);
+            if (priority >= best) continue;
+            double dx = spot.getX() - origin.getX();
+            double dz = spot.getZ() - origin.getZ();
+            if (dx * dx + dz * dz < 4 || !clearCastPath(origin, spot, CHARGE_MAX_RANGE)) continue;
+            Vector heading = new Vector(dx, 0, dz);
+            Location endpoint = spot.clone().add(heading.normalize().multiply(4));
+            if (!clearCastPath(origin, endpoint, CHARGE_MAX_RANGE + 4)) continue;
             best = priority;
             target = player;
-            aim = spot;
+            aim = endpoint;
         }
         if (target == null) return;
-        Vector heading = aim.toVector().subtract(origin.toVector()).setY(0);
-        if (heading.lengthSquared() < 4) return;
-        aim.add(heading.normalize().multiply(4));
-        fight.nextAiCheck = fight.age + cooldown;
-        if (!DragonParticles.loaded(aim) || !SkyBite.tryNativeCharge(dragon, aim)) return;
-        fight.aiChargeUntil = fight.age + 65;
-        beginCast(fight);
-        fight.lastAiTarget = target.getUniqueId();
+        fight.requestPhase(EnderDragon.Phase.HOVER);
+        if (dragon.getPhase() != EnderDragon.Phase.HOVER) return;
+        dragon.setVelocity(new Vector());
+        float yaw = (float) (180 - Math.toDegrees(Math.atan2(aim.getX() - origin.getX(), aim.getZ() - origin.getZ())));
+        dragon.setRotation(yaw, 0);
+        var warning = new ChargeWarning(target.getUniqueId(), aim, fight.age + CHARGE_WARNING_TICKS);
+        fight.chargeWarning = warning;
+        drawAiChargeWarning(origin, warning.aim());
         target.sendActionBar(language.message("ai-charge-warning", NamedTextColor.RED));
         dragon.getWorld().playSound(origin, Sound.ENTITY_ENDER_DRAGON_GROWL, 2.5f, 1.25f);
     }
 
-    private boolean startMinorSkill(Fight fight, List<Player> players, double health, boolean major) {
+    private boolean tickAiChargeWarning(Fight fight, List<Player> players) {
+        ChargeWarning warning = fight.chargeWarning;
+        EnderDragon dragon = fight.dragon;
+        if (dragon.getPhase() != EnderDragon.Phase.HOVER || dragon.isInvulnerable()
+            || players.stream().noneMatch(player -> player.getUniqueId().equals(warning.target()))) {
+            fight.cancelAiChargeWarning();
+            return false;
+        }
+        Location origin = dragon.getLocation().add(0, 2, 0);
+        if (fight.age < warning.launchAt()) {
+            if ((warning.launchAt() - fight.age) % 4 == 0) {
+                drawAiChargeWarning(origin, warning.aim());
+            }
+            return true;
+        }
+        if (!clearCastPath(origin, warning.aim(), CHARGE_MAX_RANGE + 12)
+            || !fight.maintainNativeCharge(warning.aim())) {
+            fight.cancelAiChargeWarning();
+            return false;
+        }
+        fight.chargeWarning = null;
+        origin.getWorld().playSound(origin, Sound.ENTITY_ENDER_DRAGON_FLAP, 3f, 1f);
+        fight.nextAiCheck = fight.age + fight.settings.aiChargeTicks();
+        fight.aiChargeUntil = fight.age + 65;
+        fight.aiChargeTarget = warning.aim().clone();
+        fight.nextAiChargeReaim = fight.age + NATIVE_CHARGE_REFRESH_TICKS;
+        fight.lastAttackTarget = warning.target();
+        beginCast(fight);
+        return true;
+    }
+
+    private static void drawAiChargeWarning(Location origin, Location aim) {
+        var audience = DragonParticles.warningViewers(aim, 64);
+        warningLine(origin, aim, 1.25, CHARGE_WARNING, audience);
+        warningRing(aim.clone().subtract(0, .7, 0), 1.5, 16, CHARGE_WARNING, audience);
+    }
+
+    private boolean tickChargeStun(Fight fight) {
+        EnderDragon dragon = fight.dragon;
+        if (fight.chargeStunUntil > 0) {
+            if (fight.age + STEP >= fight.chargeStunUntil) {
+                fight.endChargeStun();
+                return false;
+            }
+            fight.age += STEP;
+            if (dragon.getPhase() != EnderDragon.Phase.HOVER) fight.requestPhase(EnderDragon.Phase.HOVER);
+            if (dragon.getVelocity().lengthSquared() > 0) dragon.setVelocity(new Vector());
+            return true;
+        }
+        if (fight.aiChargeUntil <= fight.age) return false;
+        ChargeBlock reason = fight.chargeBlocked;
+        if (reason == null && SkyBite.hitFlightObstacle(dragon)) reason = ChargeBlock.WALL;
+        if (reason == null) return false;
+        fight.aiChargeUntil = 0;
+        fight.aiChargeTarget = null;
+        fight.nextAiChargeReaim = 0;
+        fight.chargeBlocked = null;
+        fight.requestPhase(EnderDragon.Phase.HOVER);
+        if (dragon.getPhase() != EnderDragon.Phase.HOVER) return false;
+        dragon.setVelocity(new Vector());
+        fight.age += STEP;
+        fight.chargeStunUntil = fight.age + CHARGE_STUN_TICKS;
+        recover(fight, CHARGE_STUN_TICKS);
+        Location spot = dragon.getLocation();
+        spot.getWorld().playSound(spot, Sound.ENTITY_ENDER_DRAGON_HURT, 3f, .85f);
+        announce(DragonParticles.warningViewers(spot, 64),
+            reason == ChargeBlock.SHIELD ? "ai-charge-shield-stun" : "ai-charge-wall-stun", NamedTextColor.GOLD);
+        return true;
+    }
+
+    private record ChargeWarning(UUID target, Location aim, int launchAt) {}
+
+    private boolean startMinorSkill(Fight fight, List<Player> players, double health, boolean major, Location center) {
         var settings = fight.settings;
         var extra = settings.extra();
         MinorSkill selected = null;
         List<Player> targets = List.of();
         int earliest = Integer.MAX_VALUE;
         Location origin = fight.dragon.getLocation();
-        Location beamOrigin = origin.clone().add(0, 2, 0);
+        List<Player> loadedTargets = null;
         var phase = fight.dragon.getPhase();
         boolean biteAllowed = !fight.dragon.isInvulnerable()
             && (phase == EnderDragon.Phase.CIRCLING || phase == EnderDragon.Phase.STRAFING);
@@ -453,10 +692,24 @@ final class DragonSkills {
             if (skill.available(health) && readyAt <= fight.age && readyAt < earliest) {
                 var candidates = switch (minor) {
                     case SKY_BITE -> players.stream().filter(player -> SkyBite.canReach(origin, player)).toList();
-                    case TRACKING_LASER -> players.stream().filter(player -> clearCastPath(beamOrigin,
-                        player.getEyeLocation(), extra.trackingLaser().range())).toList();
+                    case TRACKING_LASER -> {
+                        Location beamOrigin = laserStation(center).add(0, 2, 0);
+                        Player candidate = null;
+                        for (Player player : players) {
+                            if (inRange(beamOrigin, player.getEyeLocation(), extra.trackingLaser().range())) {
+                                candidate = player;
+                                break;
+                            }
+                        }
+                        yield candidate == null ? List.<Player>of() : List.of(candidate);
+                    }
                     case THUNDER_CHAIN -> thunderChainTargets(players, skill.radius() * .75);
-                    default -> players.stream().filter(player -> DragonParticles.loaded(player.getLocation())).toList();
+                    default -> {
+                        if (loadedTargets == null) {
+                            loadedTargets = players.stream().filter(player -> DragonParticles.loaded(player.getLocation())).toList();
+                        }
+                        yield loadedTargets;
+                    }
                 };
                 if (candidates.isEmpty()) {
                     fight.minorReady.put(minor, fight.age + (minor == MinorSkill.THUNDER_CHAIN ? 40 : 10));
@@ -468,15 +721,24 @@ final class DragonSkills {
             }
         }
         if (selected == null) return false;
-        Player target = targets.get(ThreadLocalRandom.current().nextInt(targets.size()));
-        for (Player player : players) player.sendActionBar(language.message(selected.warning, NamedTextColor.LIGHT_PURPLE));
+        if (selected == MinorSkill.TRACKING_LASER) {
+            if (!startLaserApproach(fight, center, false)) {
+                fight.minorReady.put(selected, fight.age + LASER_RETRY_TICKS);
+                return false;
+            }
+            beginCast(fight);
+            return true;
+        }
+        Player target = selected == MinorSkill.THUNDER_CHAIN ? targets.getFirst()
+            : fight.regularStyle.target(targets, origin, fight.lastAttackTarget);
+        fight.lastAttackTarget = target.getUniqueId();
+        Component warning = language.message(selected.warning, NamedTextColor.LIGHT_PURPLE);
+        for (Player player : players) player.sendActionBar(warning);
         fight.minorReady.put(selected, fight.age + selected.settings(extra).cooldownTicks());
         if (major) beginMajorCast(fight);
         else beginCast(fight);
         if (selected == MinorSkill.SKY_BITE) {
             fight.bite = new SkyBite(fight.dragon, target, language, extra, settings.tuning().damageScale());
-        } else if (selected == MinorSkill.TRACKING_LASER) {
-            fight.trackingLaser = new TrackingLaser(fight.dragon, target, language, extra.trackingLaser(), settings.tuning().damageScale());
         } else if (selected == MinorSkill.THUNDER_CHAIN) {
             fight.cast = new Cast(selected.attack, origin, target.getLocation());
             fight.cast.chainFirst = targets.get(0);
@@ -502,21 +764,35 @@ final class DragonSkills {
 
     private static List<Player> thunderChainTargets(List<Player> players, double range) {
         if (players.size() < 2) return List.of();
-        Player anchor = players.get(ThreadLocalRandom.current().nextInt(players.size()));
-        Location start = anchor.getLocation();
-        if (!DragonParticles.loaded(start)) return List.of();
-        double nearest = range * range;
-        Player partner = null;
+        List<Player> candidates = new ArrayList<>();
+        List<Location> positions = new ArrayList<>();
         for (Player player : players) {
-            if (player == anchor) continue;
-            Location spot = player.getLocation();
-            double distance = spot.distanceSquared(start);
-            if (distance <= nearest && DragonParticles.loaded(spot)) {
-                partner = player;
-                nearest = distance;
-            }
+            Location position = player.getLocation();
+            if (!DragonParticles.loaded(position)) continue;
+            candidates.add(player);
+            positions.add(position);
         }
-        return partner == null ? List.of() : List.of(anchor, partner);
+        int count = candidates.size();
+        if (count < 2) return List.of();
+        int anchor = ThreadLocalRandom.current().nextInt(count);
+        double limit = range * range;
+        for (int remaining = count - 1; remaining > 0; remaining--) {
+            double nearest = limit;
+            int partner = -1;
+            Location anchorPosition = positions.get(anchor);
+            int index = anchor;
+            for (int checked = 0; checked < remaining; checked++) {
+                if (++index == count) index = 0;
+                double distance = anchorPosition.distanceSquared(positions.get(index));
+                if (distance < nearest || (distance == nearest && index > partner)) {
+                    nearest = distance;
+                    partner = index;
+                }
+            }
+            if (partner >= 0) return List.of(candidates.get(anchor), candidates.get(partner));
+            if (++anchor == count) anchor = 0;
+        }
+        return List.of();
     }
 
     private void roar(Location origin, List<Player> players, double range, Settings.Tuning tuning) {
@@ -620,14 +896,11 @@ final class DragonSkills {
         double length = delta.length();
         if (length < .01) return true;
         Vector direction = delta.multiply(1 / length);
-        Location probe = from.clone();
-        for (double distance = 1; distance < length; distance++) {
-            if (!DragonParticles.loaded(probe.add(direction))) return false;
-        }
+        if (LaserGuard.loadedLength(from, direction, length) + .001 < length) return false;
         return from.getWorld().rayTraceBlocks(from, direction, length, FluidCollisionMode.NEVER, true) == null;
     }
 
-    private boolean startDatapackPhase(Fight fight, List<Player> players, double health) {
+    private boolean startDatapackPhase(Fight fight, List<Player> players, double health, Location center) {
         var dragon = fight.dragon;
         var settings = fight.settings;
         if (!fight.halfPhase && health <= settings.tuning().fireballHp() && settings.fireball() >= 0) {
@@ -638,26 +911,28 @@ final class DragonSkills {
             dragon.getWorld().playSound(dragon.getLocation(), Sound.BLOCK_ENDER_CHEST_OPEN, 6, .6f);
             return true;
         }
-        if (!fight.quarterPhase && health <= settings.tuning().laserHp() && settings.laser() >= 0) {
-            fight.quarterPhase = true;
-            fight.phase = CombatPhase.LASER;
-            fight.phaseTick = 0;
-            announce(players, "laser-phase", NamedTextColor.DARK_PURPLE);
-            return true;
-        }
         if (!fight.phaseDiveUsed && fight.age >= fight.nextPhaseDiveCheck && settings.dive() >= 0
-            && health <= settings.tuning().diveHp()) {
+            && health <= settings.tuning().diveHp() && SkyBite.nativeChargeAvailable() && !dragon.isInvulnerable()) {
             Location position = dragon.getLocation();
-            if (players.stream().noneMatch(player -> horizontalDistanceSquared(player.getLocation(), position) <= 40 * 40)) {
-                fight.nextPhaseDiveCheck = fight.age + 10;
-                return false;
+            fight.nextPhaseDiveCheck = fight.age + 20;
+            for (Player player : players) {
+                Location target = player.getLocation();
+                if (!clearCastPath(position, target.clone().add(0, 2, 0), 64)) continue;
+                Location landing = TrueEndingImpact.fireballImpact(target);
+                if (position.getY() - landing.getY() < 7 || !clearCastPath(position, landing.clone().add(0, 2, 0), 64)) continue;
+                fight.requestPhase(EnderDragon.Phase.HOVER);
+                if (dragon.getPhase() != EnderDragon.Phase.HOVER) break;
+                dragon.setVelocity(new Vector());
+                fight.phaseDiveTarget = landing;
+                fight.phase = CombatPhase.DIVE;
+                fight.phaseTick = 0;
+                announce(players, "dive-warning", NamedTextColor.GOLD);
+                return true;
             }
-            fight.phaseDiveUsed = true;
-            fight.phase = CombatPhase.DIVE;
-            fight.diveCount = 1;
-            fight.phaseTick = -40;
-            announce(players, "dive-warning", NamedTextColor.GOLD);
-            return true;
+        }
+        if (fight.age >= fight.nextSweepAttempt && health <= settings.tuning().laserHp() && settings.laser() >= 0) {
+            if (startLaserApproach(fight, center, true)) return true;
+            fight.nextSweepAttempt = fight.age + LASER_RETRY_TICKS;
         }
         return false;
     }
@@ -668,7 +943,7 @@ final class DragonSkills {
             case ULTRA_FIREBALL -> ultraFireball(dragon, fight, particles);
             case EXTRA_FIREBALL -> extraFireball(fight, particles);
             case LASER -> laserPhase(dragon, fight, particles);
-            case DIVE -> divePhase(dragon, fight, center, particles);
+            case DIVE -> divePhase(dragon, fight, particles);
             case NONE -> { }
         }
     }
@@ -702,21 +977,6 @@ final class DragonSkills {
         }
     }
 
-    private boolean replaceVanillaFireball(Fight fight, DragonParticles particles) {
-        Location origin = fight.dragon.getLocation();
-        for (DragonFireball fireball : origin.getWorld().getNearbyEntitiesByType(DragonFireball.class, origin, 32)) {
-            if (!fight.dragon.equals(fireball.getShooter()) || fireball.getTicksLived() > 2) continue;
-            fireball.remove();
-            launchUltra(fight, particles, origin.clone(), false, false);
-            var maxHealth = fight.dragon.getAttribute(Attribute.MAX_HEALTH);
-            if (maxHealth != null && fight.dragon.getHealth() < maxHealth.getValue()) {
-                fight.phase = CombatPhase.EXTRA_FIREBALL;
-                fight.phaseTick = -1;
-            }
-            return true;
-        }
-        return false;
-    }
 
     private void launchUltra(Fight fight, DragonParticles particles, Location origin, boolean offsetShot, boolean immediate) {
         var targets = origin.getWorld().getPlayers().stream()
@@ -736,32 +996,120 @@ final class DragonSkills {
         if (immediate) origin.getWorld().playSound(origin, Sound.ENTITY_ENDER_DRAGON_SHOOT, 10, 1);
     }
 
+    private static Location laserStation(Location center) {
+        double height = Math.min(center.getWorld().getMaxHeight() - 8, center.getY() + 20);
+        return new Location(center.getWorld(), center.getBlockX() + .5, height, center.getBlockZ() + .5);
+    }
+
+    private record LaserApproach(Location station, int deadline, boolean sweep, int nextRetry) {}
+
+    private boolean startLaserApproach(Fight fight, Location center, boolean sweep) {
+        EnderDragon dragon = fight.dragon;
+        Location station = laserStation(center);
+        if (!SkyBite.nativeChargeAvailable() || dragon.getPhase() == EnderDragon.Phase.DYING || dragon.isInvulnerable()
+            || station.getY() - center.getY() < 8 || !DragonParticles.loaded(station)
+            || !station.getBlock().isPassable()) return false;
+        fight.laserApproach = new LaserApproach(station, fight.age + LASER_FLIGHT_TIMEOUT, sweep,
+            fight.age + NATIVE_CHARGE_REFRESH_TICKS);
+        if (!atLaserStation(dragon.getLocation(), station) && !fight.maintainNativeCharge(station)) {
+            fight.releaseLaserFlight();
+            fight.laserApproach = null;
+            return false;
+        }
+        if (atLaserStation(dragon.getLocation(), station)) fight.requestPhase(EnderDragon.Phase.HOVER);
+        return true;
+    }
+
+    private static boolean atLaserStation(Location position, Location station) {
+        return horizontalDistanceSquared(position, station) <= 16 && Math.abs(position.getY() - station.getY()) <= 4;
+    }
+
+    private static boolean holdLaserStation(Fight fight, Location pose) {
+        EnderDragon dragon = fight.dragon;
+        if (dragon.isInvulnerable() || dragon.getPhase() == EnderDragon.Phase.DYING) return false;
+        if (!atLaserStation(dragon.getLocation(), pose)) return false;
+        if (dragon.getPhase() != EnderDragon.Phase.HOVER) fight.requestPhase(EnderDragon.Phase.HOVER);
+        if (dragon.getPhase() != EnderDragon.Phase.HOVER) return false;
+        if (dragon.getVelocity().lengthSquared() > .01) dragon.setVelocity(new Vector());
+        return true;
+    }
+
+    private void tickLaserApproach(Fight fight, List<Player> players) {
+        EnderDragon dragon = fight.dragon;
+        LaserApproach approach = fight.laserApproach;
+        Location actual = dragon.getLocation();
+        if (dragon.getPhase() != EnderDragon.Phase.DYING && !dragon.isInvulnerable() && fight.age < approach.deadline()
+            && DragonParticles.loaded(approach.station())) {
+            if (atLaserStation(actual, approach.station())) {
+                fight.requestPhase(EnderDragon.Phase.HOVER);
+                if (dragon.getPhase() == EnderDragon.Phase.HOVER) {
+                    dragon.setVelocity(new Vector());
+                    if (approach.sweep()) {
+                        fight.quarterPhase = true;
+                        fight.nextSweepAttempt = fight.age + fight.settings.sweepCooldownTicks();
+                        fight.phase = CombatPhase.LASER;
+                        fight.phaseTick = 181;
+                        fight.laserPose = actual;
+                        fight.sweepGuard = new LaserGuard();
+                        fight.laserApproach = null;
+                        beginMajorCast(fight);
+                        announce(players, "laser-phase", NamedTextColor.DARK_PURPLE);
+                        return;
+                    }
+                    var beam = fight.settings.extra().trackingLaser();
+                    Location origin = actual.clone().add(0, 2, 0);
+                    var targets = players.stream().filter(player -> clearCastPath(origin, player.getEyeLocation(), beam.range())).toList();
+                    if (!targets.isEmpty()) {
+                        Player target = fight.regularStyle.target(targets, origin, fight.lastAttackTarget);
+                        fight.lastAttackTarget = target.getUniqueId();
+                        fight.minorReady.put(MinorSkill.TRACKING_LASER, fight.age + beam.skill().cooldownTicks());
+                        beginCast(fight);
+                        announce(players, MinorSkill.TRACKING_LASER.warning, NamedTextColor.LIGHT_PURPLE);
+                        fight.laserPose = actual;
+                        fight.trackingLaser = new TrackingLaser(dragon, target, language, beam, fight.settings.tuning().damageScale());
+                        fight.laserApproach = null;
+                        return;
+                    }
+                }
+            } else {
+                if (fight.age >= approach.nextRetry()) {
+                    if (!fight.maintainNativeCharge(approach.station())) {
+                        fight.releaseLaserFlight();
+                        fight.laserApproach = null;
+                        if (approach.sweep()) fight.nextSweepAttempt = fight.age + LASER_RETRY_TICKS;
+                        else fight.minorReady.put(MinorSkill.TRACKING_LASER, fight.age + LASER_RETRY_TICKS);
+                        recover(fight, fight.settings.rhythm().recovery());
+                        return;
+                    }
+                    fight.laserApproach = new LaserApproach(approach.station(), approach.deadline(), approach.sweep(),
+                        fight.age + NATIVE_CHARGE_REFRESH_TICKS);
+                }
+                return;
+            }
+        }
+        fight.releaseLaserFlight();
+        fight.laserApproach = null;
+        if (approach.sweep()) fight.nextSweepAttempt = fight.age + LASER_RETRY_TICKS;
+        else fight.minorReady.put(MinorSkill.TRACKING_LASER, fight.age + LASER_RETRY_TICKS);
+        recover(fight, fight.settings.rhythm().recovery());
+    }
+
     private void laserPhase(EnderDragon dragon, Fight fight, DragonParticles particles) {
-        int tick = fight.phaseTick;
-        if (tick <= 40) {
-            if (tick == 1) dragon.setPhase(EnderDragon.Phase.FLY_TO_PORTAL);
+        if (!holdLaserStation(fight, fight.laserPose)) {
+            fight.releaseLaserFlight();
+            fight.phase = CombatPhase.NONE;
+            fight.phaseTick = 0;
+            fight.laserPose = null;
+            fight.sweepGuard = null;
             return;
         }
-        if (tick == 41) {
-            fight.laserPose = dragon.getLocation();
-            dragon.setPhase(EnderDragon.Phase.CIRCLING);
-        }
+        int tick = fight.phaseTick;
         if (tick >= 200 && tick <= 240 && tick % 10 == 0) {
             dragon.getWorld().playSound(dragon.getLocation(), Sound.ENTITY_ILLUSIONER_PREPARE_BLINDNESS, 8, 1.6f);
             dragon.getWorld().playSound(dragon.getLocation(), Sound.ENTITY_ILLUSIONER_PREPARE_BLINDNESS, 8, 1.1f);
         }
         if (tick == 202) dragon.getWorld().playSound(dragon.getLocation(), Sound.BLOCK_BELL_RESONATE, 8, 1.2f);
         Location pose = fight.laserPose;
-        Location actual = dragon.getLocation();
-        double rate = tick < 60 ? .5 : 1;
-        double rise = actual.getBlockY() < 85 ? rate : actual.getBlockY() > 85 ? -rate : 0;
-        Location lifted = actual.clone().add(0, rise, 0);
-        if (Math.abs(rise) > .01 && DragonParticles.loaded(lifted)) dragon.teleport(lifted);
-        if (tick <= 180 && dragon.getLocation().getBlockY() == 85) fight.phaseTick = 181;
-        Vector position = dragon.getLocation().toVector();
-        pose.setX(position.getX());
-        pose.setY(position.getY());
-        pose.setZ(position.getZ());
         if (tick >= 248 && tick <= 253) {
             Location flat = pose.clone();
             flat.setPitch(0);
@@ -781,9 +1129,11 @@ final class DragonSkills {
             pose.setPitch(pose.getPitch() + (float) tilt);
         }
         if (tick >= 575) {
-            dragon.setPhase(EnderDragon.Phase.CIRCLING);
+            fight.releaseLaserFlight();
             fight.phase = CombatPhase.NONE;
             fight.phaseTick = 0;
+            fight.laserPose = null;
+            fight.sweepGuard = null;
         }
     }
 
@@ -792,96 +1142,101 @@ final class DragonSkills {
         flat.setPitch(0);
         Vector forward = flat.getDirection();
         Vector left = new Vector(forward.getZ(), 0, -forward.getX());
-        Location spot = pose.clone().add(forward.multiply(-5)).add(left.multiply(-3));
+        Location start = pose.clone().add(forward.multiply(-5)).add(left.multiply(-3));
         Location reverse = pose.clone();
         reverse.setYaw(reverse.getYaw() - 180);
         Vector direction = reverse.getDirection();
-        Location start = spot.clone().subtract(0, 1, 0);
-        int length = -1;
+        double length = LaserGuard.loadedLength(start, direction, 128);
+        if (length < .001) return;
+        var block = start.getWorld().rayTraceBlocks(start, direction, length, FluidCollisionMode.NEVER, true);
         Location impact = null;
-        for (int step = 0; step < 128 && DragonParticles.loaded(spot); step++, spot.add(direction)) {
-            length = step;
-            if (step % 3 == 0) particles.laser(spot, direction);
-            if (DragonParticles.stopsLaser(spot)) {
-                impact = spot.clone();
-                impact.setY(impact.getBlockY());
-                Location cloudSpot = impact.clone().add(0, 1, 0);
-                if (fight.breathClouds.size() < 6 && fight.age >= fight.nextLaserCloud
-                    && ThreadLocalRandom.current().nextInt(10) == 0 && DragonParticles.loaded(cloudSpot)) {
-                    fight.breathClouds.add(TrueEndingImpact.cloud(fight.dragon, cloudSpot, 400));
-                    fight.nextLaserCloud = fight.age + 20;
-                }
-                particles.laserHit(spot);
-                break;
+        if (block != null) {
+            impact = block.getHitPosition().toLocation(start.getWorld());
+            length = start.distance(impact);
+            Location cloudSpot = impact.clone();
+            cloudSpot.setY(block.getHitBlock().getY() + 1.0);
+            if (block.getHitBlockFace() == org.bukkit.block.BlockFace.UP && fight.breathClouds.size() < 6 && fight.age >= fight.nextLaserCloud
+                && ThreadLocalRandom.current().nextInt(10) == 0 && DragonParticles.loaded(cloudSpot)) {
+                fight.breathClouds.add(TrueEndingImpact.cloud(fight.dragon, cloudSpot, 400));
+                fight.nextLaserCloud = fight.age + 20;
             }
+            particles.laserHit(impact);
         }
-        if (length >= 0) laserDamage(fight, particles, start, direction, length, impact);
+        Location spot = start.clone();
+        for (int step = 0; step < length; step += 3) {
+            particles.laser(spot, direction);
+            spot.add(direction.getX() * 3, direction.getY() * 3, direction.getZ() * 3);
+        }
+        if (length >= .001) laserDamage(fight, particles, start, direction, length, impact);
     }
 
-    private void laserDamage(Fight fight, DragonParticles particles, Location start, Vector direction, int length, Location impact) {
+    private void laserDamage(Fight fight, DragonParticles particles, Location start, Vector direction, double length, Location impact) {
         Location end = start.clone().add(direction.clone().multiply(length));
         var box = org.bukkit.util.BoundingBox.of(start, end).expand(5);
         var world = start.getWorld();
         for (Entity candidate : world.getNearbyEntities(box)) {
             if (!(candidate instanceof LivingEntity target) || !TrueEndingImpact.target(target)) continue;
+            Player player = target instanceof Player participant ? participant : null;
+            if (player != null && player.getGameMode() != GameMode.SURVIVAL && player.getGameMode() != GameMode.ADVENTURE) continue;
+            boolean hurtReady = target.getNoDamageTicks() <= target.getMaximumNoDamageTicks() / 2;
+            if (!hurtReady && (player == null || !player.isBlocking())) continue;
             Location position = target.getLocation();
             double projection = (position.getX() - start.getX()) * direction.getX()
                 + (position.getY() - start.getY()) * direction.getY() + (position.getZ() - start.getZ()) * direction.getZ();
-            int sample = (int) Math.round(Math.clamp(projection, 0, length));
+            double sample = Math.clamp(projection, 0, length);
             double dx = position.getX() - (start.getX() + direction.getX() * sample);
             double dy = position.getY() - (start.getY() + direction.getY() * sample);
             double dz = position.getZ() - (start.getZ() + direction.getZ() * sample);
             if (dx * dx + dy * dy + dz * dz > 2.25 && (impact == null || position.distanceSquared(impact) > 20.25)) continue;
-            if (target.getNoDamageTicks() > target.getMaximumNoDamageTicks() / 2) continue;
+            Location body = target.getBoundingBox().getCenter().toLocation(world);
+            if (!LaserGuard.hasLineOfSight(start, body)) continue;
+            if (player != null && fight.sweepGuard.block(player, start, fight.age)) continue;
+            if (!hurtReady) continue;
             particles.laserEntityHit(position);
             world.playSound(position, Sound.ENTITY_BLAZE_DEATH, 2, .6f);
             hurtEntity(target, fight.dragon, fight.settings.laser() * fight.settings.tuning().damageScale(), DamageType.DRAGON_BREATH);
         }
     }
 
-    private void divePhase(EnderDragon dragon, Fight fight, Location center, DragonParticles particles) {
-        int tick = fight.phaseTick;
-        if (fight.diveCount > 1 && (tick == 20 || tick == 50)) {
-            Location origin = dragon.getLocation();
-            double angle = ThreadLocalRandom.current().nextDouble(2 * Math.PI);
-            origin.add(6 * Math.cos(angle), 0, 6 * Math.sin(angle));
-            if (DragonParticles.loaded(origin)) {
-                origin.setY(Math.min(origin.getWorld().getHighestBlockYAt(origin) + 129, origin.getWorld().getMaxHeight() - 1));
-                fight.mirrorDragons.add(new MirrorDragon(origin));
+    private void divePhase(EnderDragon dragon, Fight fight, DragonParticles particles) {
+        Location landing = fight.phaseDiveTarget;
+        Location position = dragon.getLocation();
+        int frame = fight.phaseTick;
+        if (frame <= 30 && dragon.getPhase() == EnderDragon.Phase.HOVER && DragonParticles.loaded(landing)) {
+            if (frame % 5 == 1) {
+                var audience = DragonParticles.warningViewers(landing, 48);
+                warningRing(landing, 12, 48, CROSS_WARNING, audience);
+                warningRing(landing, 6, 24, CROSS_WARNING, audience);
+            }
+            if (frame < 30) return;
+            Location destination = landing.clone().add(0, 2, 0);
+            if (clearCastPath(position, destination, 64) && fight.maintainNativeCharge(destination)) {
+                fight.phaseDiveNextReaim = fight.age + NATIVE_CHARGE_REFRESH_TICKS;
+                position.getWorld().playSound(position, Sound.ENTITY_ENDER_DRAGON_FLAP, 5, 1);
+                return;
+            }
+        } else if (frame > 30 && DragonParticles.loaded(landing)) {
+            if (horizontalDistanceSquared(position, landing) <= 36 && Math.abs(position.getY() - landing.getY()) <= 7) {
+                fight.phaseDiveUsed = true;
+                diveImpact(fight, particles, landing);
+            } else if (frame < 100 && !SkyBite.hitFlightObstacle(dragon)) {
+                if (fight.age >= fight.phaseDiveNextReaim) {
+                    if (!fight.maintainNativeCharge(landing.clone().add(0, 2, 0))) {
+                        fight.releasePhaseDive();
+                        fight.nextPhaseDiveCheck = fight.age + 100;
+                        fight.phase = CombatPhase.NONE;
+                        fight.phaseTick = 0;
+                        return;
+                    }
+                    fight.phaseDiveNextReaim = fight.age + NATIVE_CHARGE_REFRESH_TICKS;
+                }
+                return;
             }
         }
-        Location spot = dragon.getLocation();
-        if (fight.diveCount > 1 && tick <= 80 && DragonParticles.loaded(center)) {
-            Location warning = center.clone();
-            warning.setY(warning.getWorld().getHighestBlockYAt(warning, org.bukkit.HeightMap.MOTION_BLOCKING) - 5);
-            float pitch = (float) Math.min(72, Math.max(0, (tick + 1) * 1.8));
-            particles.diveWarning(warning, (tick + 40) * 2, pitch);
-        }
-        if (tick == 0 || tick == 10 || tick == 20) spot.getWorld().playSound(spot, Sound.ENTITY_ENDER_DRAGON_GROWL, 5, 1);
-        if (tick == 40 || tick == 44 || tick == 48 || tick == 540 || tick == 544 || tick == 548
-            || tick == 570 || tick == 574 || tick == 578) spot.getWorld().playSound(spot, Sound.ENTITY_ENDER_DRAGON_FLAP, 5, 1);
-        double rise = tick >= 1 && tick <= 30 ? (tick <= 10 || tick >= 21 ? .5 : 1)
-            : tick >= 40 && tick < 200 ? (tick < 50 ? -.5 : tick < 60 ? -1 : -2)
-            : tick > 200 && tick <= 210 ? .2 : tick >= 500 && tick <= 520 ? -1 : tick >= 560 && tick <= 600 ? .4 : 0;
-        if (tick >= 500 && tick <= 600) dragon.setPhase(EnderDragon.Phase.LAND_ON_PORTAL);
-        if (tick >= 521 && tick <= 599) {
-            spot.setX(center.getBlockX());
-            spot.setZ(center.getBlockZ());
-        }
-        if ((rise != 0 || (tick >= 521 && tick <= 599)) && DragonParticles.loaded(spot.add(0, rise, 0))) dragon.teleport(spot);
-        if (tick >= 40 && tick <= 200) {
-            Location current = dragon.getLocation();
-            Location below = current.clone().subtract(0, 3, 0);
-            if (tick == 200 || current.getBlockY() <= 32 || (DragonParticles.loaded(below) && !TrueEndingImpact.permeable(below))) {
-                diveImpact(fight, particles, current);
-                fight.phaseTick = fight.diveCount > 1 ? 499 : 200;
-            }
-        }
-        if ((fight.diveCount <= 1 && tick == 210) || tick >= 800) {
-            dragon.setPhase(EnderDragon.Phase.CIRCLING);
-            fight.phase = CombatPhase.NONE;
-            fight.phaseTick = 0;
-        }
+        fight.releasePhaseDive();
+        fight.nextPhaseDiveCheck = fight.age + 100;
+        fight.phase = CombatPhase.NONE;
+        fight.phaseTick = 0;
     }
 
     private void diveImpact(Fight fight, DragonParticles particles, Location position) {
@@ -924,6 +1279,30 @@ final class DragonSkills {
             double angle = Math.TAU * point / points;
             world.spawnParticle(Particle.DUST, center.getX() + radius * Math.cos(angle), center.getY() + .15,
                 center.getZ() + radius * Math.sin(angle), 1, 0, 0, 0, 0, dust);
+        }
+    }
+
+    static void warningRing(Location center, double radius, int points, Particle.DustOptions dust, List<Player> audience) {
+        if (audience.isEmpty()) return;
+        for (int point = 0; point < points; point++) {
+            double angle = Math.TAU * point / points;
+            warningPoint(center, radius * Math.cos(angle), .15, radius * Math.sin(angle), dust, audience);
+        }
+    }
+
+    private static void warningPoint(Location center, double offsetX, double offsetY, double offsetZ,
+                                     Particle.DustOptions dust, List<Player> audience) {
+        if (!audience.isEmpty()) center.getWorld().spawnParticle(Particle.DUST, audience, null,
+            center.getX() + offsetX, center.getY() + offsetY, center.getZ() + offsetZ, 1, 0, 0, 0, 0, dust, true);
+    }
+
+    private static void warningLine(Location start, Location end, double spacing, Particle.DustOptions dust, List<Player> audience) {
+        if (audience.isEmpty()) return;
+        Vector delta = end.toVector().subtract(start.toVector());
+        int segments = Math.clamp((int) Math.ceil(delta.length() / spacing), 1, 80);
+        for (int point = 0; point <= segments; point++) {
+            double fraction = (double) point / segments;
+            warningPoint(start, delta.getX() * fraction, delta.getY() * fraction, delta.getZ() * fraction, dust, audience);
         }
     }
 
@@ -973,6 +1352,30 @@ final class DragonSkills {
             return this == FINALE || this == THUNDERSTORM || this == END_CROSS;
         }
     }
+    private enum RegularStyle {
+        SCOUT(Attack.SHOCKWAVE, Attack.SHOCKWAVE, Attack.FIREBALL, Attack.DIVE, Attack.LASER),
+        STORM(Attack.DIVE, Attack.SHOCKWAVE, Attack.FIREBALL, Attack.LASER),
+        ABYSS(Attack.FIREBALL, Attack.LASER, Attack.SHOCKWAVE, Attack.DIVE),
+        SOVEREIGN(Attack.SHOCKWAVE, Attack.DIVE, Attack.FIREBALL, Attack.DIVE, Attack.LASER);
+
+        private final List<Attack> rotation;
+
+        RegularStyle(Attack... rotation) {
+            this.rotation = List.of(rotation);
+        }
+
+        private Player target(List<Player> candidates, Location origin, UUID previous) {
+            if (this == SCOUT) {
+                return candidates.stream().min(java.util.Comparator.comparingDouble(player -> player.getLocation().distanceSquared(origin))).orElseThrow();
+            }
+            if (this == STORM || this == SOVEREIGN) {
+                var fresh = candidates.stream().filter(player -> !player.getUniqueId().equals(previous)).toList();
+                if (!fresh.isEmpty()) candidates = fresh;
+            }
+            return candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
+        }
+    }
+
     private enum MinorSkill {
         THUNDERSTORM(Attack.THUNDERSTORM, "thunderstorm-warning"), THUNDER(Attack.THUNDER, "thunder-warning"),
         THUNDER_CHAIN(Attack.THUNDER_CHAIN, "thunder-chain-warning"),
@@ -1124,19 +1527,22 @@ final class DragonSkills {
         private int nextRegularCast;
         private int nextMajorCast;
         private boolean preferRegular;
-        private Attack lastRegularAttack;
+        private int regularCursor;
+        private UUID lastAttackTarget;
+        private final RegularStyle regularStyle;
         private boolean reinforcementsPending;
         private int nextAiCheck;
+        private int nextAiChargeReaim;
+        private int phaseDiveNextReaim;
         private int nextLaserCloud;
         private int aiChargeUntil;
-        private UUID lastAiTarget;
+        private int chargeStunUntil;
+        private ChargeBlock chargeBlocked;
+        private ChargeWarning chargeWarning;
         private int nextRoar;
         private int nextCast;
         private boolean idle;
         private boolean podiumActive;
-        private boolean usedFireball;
-        private boolean usedLaser;
-        private boolean usedDive;
         private int crystalReaction;
         private int nextRevivalCheck;
         private int nextPodiumCheck;
@@ -1153,13 +1559,18 @@ final class DragonSkills {
         private final List<MirrorDragon> mirrorDragons = new ArrayList<>();
         private final List<GroundWave> waves = new ArrayList<>();
         private Location laserPose;
+        private Location aiChargeTarget;
+        private LaserGuard sweepGuard;
+        private LaserApproach laserApproach;
+        private int nextSweepAttempt;
         private Cast cast;
         private CombatPhase phase = CombatPhase.NONE;
         private int phaseTick;
         private boolean halfPhase;
         private boolean quarterPhase;
         private boolean phaseDiveUsed;
-        private int diveCount;
+        private Location phaseDiveTarget;
+        private boolean pluginPhaseChange;
         private DragonRushCast rush;
         private SkyBite bite;
         private TrackingLaser trackingLaser;
@@ -1167,9 +1578,15 @@ final class DragonSkills {
 
         private final Settings settings;
 
-        private Fight(EnderDragon dragon, Settings settings, int interval) {
+        private Fight(EnderDragon dragon, DragonProfiles.Profile profile, int interval) {
             this.dragon = dragon;
-            this.settings = settings;
+            this.settings = profile.combat();
+            this.regularStyle = switch (profile.id()) {
+                case "storm" -> RegularStyle.STORM;
+                case "abyss" -> RegularStyle.ABYSS;
+                case "sovereign" -> RegularStyle.SOVEREIGN;
+                default -> RegularStyle.SCOUT;
+            };
             nextRegularCast = interval;
             nextAiCheck = settings.aiChargeTicks();
         }
@@ -1185,25 +1602,109 @@ final class DragonSkills {
         }
 
         private boolean hasActiveCast() {
-            return revivalCasting || aiChargeUntil > 0 || podiumActive || rush != null || bite != null || trackingLaser != null || phase != CombatPhase.NONE || cast != null;
+            return revivalCasting || chargeWarning != null || aiChargeUntil > 0 || chargeStunUntil > 0 || podiumActive || rush != null || bite != null || trackingLaser != null
+                || laserApproach != null || phase != CombatPhase.NONE || cast != null;
+        }
+
+        private boolean controlsFlightPhase() {
+            return !idle && (bite != null || chargeWarning != null || aiChargeUntil > 0 || chargeStunUntil > 0
+                || laserApproach != null || trackingLaser != null || phase == CombatPhase.DIVE || phase == CombatPhase.LASER
+                || cast != null && cast.flightControlled);
+        }
+
+        private void requestPhase(EnderDragon.Phase requested) {
+            boolean previous = pluginPhaseChange;
+            pluginPhaseChange = true;
+            try {
+                dragon.setPhase(requested);
+            } finally {
+                pluginPhaseChange = previous;
+            }
+        }
+
+        private boolean maintainNativeCharge(Location target) {
+            if (!dragon.isValid() || dragon.isDead() || dragon.getPhase() == EnderDragon.Phase.DYING
+                || target == null || !dragon.getWorld().equals(target.getWorld())) return false;
+            boolean previous = pluginPhaseChange;
+            pluginPhaseChange = true;
+            try {
+                return SkyBite.restartNativeCharge(dragon, target);
+            } finally {
+                pluginPhaseChange = previous;
+            }
+        }
+
+        private void releasePhaseDive() {
+            if (dragon.isValid() && !dragon.isDead() && dragon.getPhase() != EnderDragon.Phase.DYING
+                && (dragon.getPhase() == EnderDragon.Phase.HOVER || dragon.getPhase() == EnderDragon.Phase.CHARGE_PLAYER)) {
+                requestPhase(EnderDragon.Phase.CIRCLING);
+            }
+            phaseDiveTarget = null;
+            phaseDiveNextReaim = 0;
+        }
+
+        private void releaseCastFlight() {
+            if (cast == null || !cast.flightControlled) return;
+            cast.flightControlled = false;
+            if (dragon.isValid() && !dragon.isDead() && dragon.getPhase() != EnderDragon.Phase.DYING
+                && (dragon.getPhase() == EnderDragon.Phase.HOVER || dragon.getPhase() == EnderDragon.Phase.CHARGE_PLAYER)) {
+                requestPhase(EnderDragon.Phase.CIRCLING);
+            }
+        }
+
+        private void releaseLaserFlight() {
+            if (!dragon.isValid() || dragon.isDead()) return;
+            var current = dragon.getPhase();
+            if (current == EnderDragon.Phase.HOVER || (laserApproach != null && current == EnderDragon.Phase.CHARGE_PLAYER)) {
+                requestPhase(EnderDragon.Phase.CIRCLING);
+            }
         }
 
         private void endAiCharge() {
             if (aiChargeUntil > 0 && dragon.isValid() && !dragon.isDead() && dragon.getPhase() == EnderDragon.Phase.CHARGE_PLAYER) {
-                dragon.setPhase(EnderDragon.Phase.CIRCLING);
+                requestPhase(EnderDragon.Phase.CIRCLING);
             }
             aiChargeUntil = 0;
+            aiChargeTarget = null;
+            nextAiChargeReaim = 0;
+            chargeBlocked = null;
+        }
+
+        private void endChargeStun() {
+            if (chargeStunUntil == 0) return;
+            chargeStunUntil = 0;
+            if (dragon.isValid() && !dragon.isDead() && dragon.getPhase() == EnderDragon.Phase.HOVER) {
+                requestPhase(EnderDragon.Phase.CIRCLING);
+            }
+        }
+
+        private void cancelAiChargeWarning() {
+            if (chargeWarning == null) return;
+            chargeWarning = null;
+            if (dragon.isValid() && !dragon.isDead() && dragon.getPhase() == EnderDragon.Phase.HOVER) {
+                requestPhase(EnderDragon.Phase.CIRCLING);
+            }
         }
 
         private void cleanup() {
+            cancelAiChargeWarning();
             endAiCharge();
+            endChargeStun();
             if (revivalCasting) revival = null;
             revivalCasting = false;
-            if (bite != null) bite.cancel();
-            if ((phase == CombatPhase.DIVE || phase == CombatPhase.LASER) && dragon.isValid() && !dragon.isDead()
-                && dragon.getPhase() != EnderDragon.Phase.DYING) {
-                dragon.setPhase(EnderDragon.Phase.CIRCLING);
+            if (bite != null) {
+                boolean previous = pluginPhaseChange;
+                pluginPhaseChange = true;
+                try {
+                    bite.cancel();
+                } finally {
+                    pluginPhaseChange = previous;
+                }
             }
+            if (laserApproach != null || trackingLaser != null || phase == CombatPhase.LASER) releaseLaserFlight();
+            laserApproach = null;
+            if (phase == CombatPhase.DIVE) releasePhaseDive();
+            if (cast != null) releaseCastFlight();
             if (rush != null) rush.cleanup();
             rush = null;
             bite = null;
@@ -1212,6 +1713,7 @@ final class DragonSkills {
             phase = CombatPhase.NONE;
             phaseTick = 0;
             laserPose = null;
+            sweepGuard = null;
             fireballs.clear();
             waves.clear();
             crystalReaction = 0;
@@ -1241,8 +1743,17 @@ final class DragonSkills {
         private Vector crossDirection;
         private int age;
         private int dives = 1;
+        private RegularStyle regularStyle;
+        private UUID regularTarget;
+        private Location focusedAim;
         private Location diveTarget;
         private Location diveOrigin;
+        private Set<UUID> diveTargetsSeen;
+        private int diveStage;
+        private int diveStageStartedAt = 1;
+        private int diveFlightDeadline;
+        private int nextDiveReaim;
+        private boolean flightControlled;
 
         private Cast(Attack attack, Location origin, Location aim) {
             this.attack = attack;
@@ -1250,20 +1761,21 @@ final class DragonSkills {
             this.aim = aim;
         }
 
-        private boolean tick(EnderDragon dragon, List<Player> players, Settings settings, List<AreaEffectCloud> clouds) {
+        private boolean tick(Fight fight, List<Player> players, Settings settings, List<AreaEffectCloud> clouds, Language language) {
             age += STEP;
+            EnderDragon dragon = fight.dragon;
             var tuning = settings.tuning();
             double scale = tuning.damageScale();
             return switch (attack) {
                 case SHOCKWAVE -> shockwave(dragon, players, settings.shockwave() * scale, tuning.shockwaveRadius(), tuning.shockwaveWarning());
                 case FIREBALL -> fireball(dragon, players, settings.fireball() * scale, tuning.fireballRadius(), tuning.fireballWarning());
                 case LASER -> laser(dragon, players, settings.laser() * scale, tuning.laserRadius(), tuning.laserWarning());
-                case DIVE -> dive(dragon, players, settings.dive() * scale, tuning.diveRadius(), tuning.diveWarning());
+                case DIVE -> dive(fight, players, settings.dive() * scale, tuning.diveRadius(), tuning.diveWarning(), language);
                 case FINALE -> finale(dragon, players, settings.finale() * scale, tuning.finaleRadius(), tuning.finaleWarning());
                 case LEVITATION_FIELD -> areaSkill(dragon, players, settings.extra().levitation(), scale, clouds);
                 case BREATH_ERUPTION -> areaSkill(dragon, players, settings.extra().breath(), scale, clouds);
                 case CRYSTAL_BURST -> areaSkill(dragon, players, settings.extra().crystal(), scale, clouds);
-                case VOID_RINGS -> voidRings(dragon, players, settings.extra().voidRings(), scale);
+                case VOID_RINGS -> voidRings(dragon, players, settings.extra().voidRings(), scale, language);
                 case THUNDER, THUNDERSTORM -> {
                     if (lightning == null) lightning = new LightningCast(aim, attack == Attack.THUNDERSTORM);
                     yield lightning.tick(dragon, players, attack == Attack.THUNDER ? settings.extra().thunder()
@@ -1272,7 +1784,7 @@ final class DragonSkills {
                 case THUNDER_CHAIN -> thunderChain(dragon, players, settings.extra().thunderChain(), scale);
                 case RIFT_MARK -> riftMark(dragon, players, settings.extra().riftMark(), scale);
                 case GRAVITY_WELL -> gravityWell(dragon, players, settings.extra().gravityWell(), scale);
-                case END_CROSS -> endCross(dragon, players, settings.extra().endCross(), scale);
+                case END_CROSS -> endCross(dragon, players, settings.extra().endCross(), scale, language);
             };
         }
 
@@ -1323,7 +1835,7 @@ final class DragonSkills {
             if (age < skill.warningTicks()) {
                 if (age == STEP) aim.getWorld().playSound(aim, Sound.BLOCK_BEACON_AMBIENT, 1.4f, .65f);
                 if (age % 5 == STEP) {
-                    ring(aim, skill.radius(), 22, SAFE);
+                    ring(aim, skill.radius(), 22, PULL_WARNING);
                     ring(aim, blastRadius, 20, WARNING);
                     ring(aim, skill.radius() - (skill.radius() - blastRadius) * age / skill.warningTicks(), 14, BEAM);
                     for (Player player : players) {
@@ -1344,7 +1856,7 @@ final class DragonSkills {
             return true;
         }
 
-        private boolean endCross(EnderDragon dragon, List<Player> players, Settings.AreaSkill skill, double scale) {
+        private boolean endCross(EnderDragon dragon, List<Player> players, Settings.AreaSkill skill, double scale, Language language) {
             if (!DragonParticles.loaded(aim)) return true;
             int warning = skill.warningTicks();
             int secondWarning = Math.max(20, warning * 3 / 4);
@@ -1355,13 +1867,14 @@ final class DragonSkills {
                     : ThreadLocalRandom.current().nextDouble(Math.TAU);
                 crossDirection = new Vector(Math.cos(angle), 0, Math.sin(angle));
                 aim.getWorld().playSound(aim, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, 1.4f, second ? 1.4f : .8f);
+                if (second) warnNear(players, skill.radius() + 8, language, "end-cross-second-warning");
             }
             Vector perpendicular = new Vector(-crossDirection.getZ(), 0, crossDirection.getX());
             if (frame < (second ? secondWarning : warning)) {
-                if (frame % 5 == STEP) drawCross(perpendicular, skill.radius(), WARNING);
+                if (frame % 5 == STEP) drawCross(perpendicular, skill.radius(), CROSS_WARNING);
                 return false;
             }
-            drawCross(perpendicular, skill.radius(), BEAM);
+            drawCross(perpendicular, skill.radius(), CROSS_IMPACT);
             aim.getWorld().playSound(aim, Sound.ENTITY_WARDEN_SONIC_BOOM, 1.4f, second ? 1.15f : .8f);
             for (Player player : players) {
                 Location feet = player.getLocation();
@@ -1377,13 +1890,25 @@ final class DragonSkills {
         }
 
         private void drawCross(Vector perpendicular, double radius, Particle.DustOptions color) {
-            for (int sign : new int[]{-1, 1}) {
-                var offset = perpendicular.clone().multiply(sign * 1.15);
-                var forward = crossDirection.clone().multiply(radius);
-                line(aim.clone().add(offset).subtract(forward), aim.clone().add(offset).add(forward), 1.6, color);
-                offset = crossDirection.clone().multiply(sign * 1.15);
-                forward = perpendicular.clone().multiply(radius);
-                line(aim.clone().add(offset).subtract(forward), aim.clone().add(offset).add(forward), 1.6, color);
+            var audience = DragonParticles.warningViewers(aim, radius + 24);
+            if (audience.isEmpty()) return;
+            Location base = aim.clone().add(0, .35, 0);
+            for (int lane = -1; lane <= 1; lane++) {
+                double width = lane * 1.15;
+                Location first = base.clone().add(perpendicular.clone().multiply(width));
+                Location second = base.clone().add(crossDirection.clone().multiply(width));
+                Vector along = crossDirection.clone().multiply(radius);
+                Vector across = perpendicular.clone().multiply(radius);
+                double spacing = Math.max(lane == 0 ? 1.4 : 1, radius / 12);
+                warningLine(first.clone().subtract(along), first.add(along), spacing, color, audience);
+                warningLine(second.clone().subtract(across), second.add(across), spacing, color, audience);
+            }
+        }
+
+        private void warnNear(List<Player> players, double radius, Language language, String key) {
+            Component message = language.message(key, NamedTextColor.GOLD);
+            for (Player player : players) {
+                if (horizontalDistanceSquared(player.getLocation(), aim) <= radius * radius) player.sendActionBar(message);
             }
         }
 
@@ -1396,7 +1921,7 @@ final class DragonSkills {
             }
         }
 
-        private boolean voidRings(EnderDragon dragon, List<Player> players, Settings.AreaSkill skill, double scale) {
+        private boolean voidRings(EnderDragon dragon, List<Player> players, Settings.AreaSkill skill, double scale, Language language) {
             if (!DragonParticles.loaded(aim)) return true;
             int warning = skill.warningTicks();
             int secondWarning = Math.max(20, warning * 2 / 3);
@@ -1406,12 +1931,14 @@ final class DragonSkills {
             double radius = outer ? skill.radius() : split;
             if (frame == STEP) {
                 aim.getWorld().playSound(aim, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, 1.3f, outer ? .8f : 1.2f);
+                if (outer) warnNear(players, skill.radius() + 8, language, "void-rings-outer-warning");
             }
             if (frame < (outer ? secondWarning : warning)) {
                 if (frame % 4 == STEP) {
-                    ring(aim, radius, 32, WARNING);
-                    ring(aim, outer ? split + (radius - split) * .5 : radius * .55, 20, WARNING);
-                    if (outer) ring(aim, split, 24, SAFE);
+                    var audience = DragonParticles.warningViewers(aim, radius + 24);
+                    warningRing(aim, radius, 32, CROSS_WARNING, audience);
+                    warningRing(aim, outer ? split + (radius - split) * .5 : radius * .55, 20, CROSS_WARNING, audience);
+                    if (outer) warningRing(aim, split, 28, SAFE, audience);
                 }
                 return false;
             }
@@ -1468,8 +1995,17 @@ final class DragonSkills {
             }
             for (Player player : players) {
                 Location feet = player.getLocation();
-                if (spots.stream().noneMatch(spot -> feet.distanceSquared(spot) <= skill.radius() * skill.radius())) continue;
-                hurt(player, dragon, skill.damage() * scale);
+                Location nearest = null;
+                double distance = skill.radius() * skill.radius();
+                for (Location spot : spots) {
+                    double squared = feet.distanceSquared(spot);
+                    if (squared > distance) continue;
+                    nearest = spot;
+                    distance = squared;
+                }
+                if (nearest == null) continue;
+                if (attack == Attack.CRYSTAL_BURST) PodiumCrystal.resolveBlast(player, nearest);
+                else hurt(player, dragon, skill.damage() * scale);
                 if (attack == Attack.LEVITATION_FIELD) {
                     player.addPotionEffect(new PotionEffect(PotionEffectType.LEVITATION, 60, 0));
                     player.addPotionEffect(new PotionEffect(PotionEffectType.SLOW_FALLING, 160, 0));
@@ -1478,26 +2014,129 @@ final class DragonSkills {
             return true;
         }
 
-        private boolean dive(EnderDragon dragon, List<Player> players, double damage, double radius, int warning) {
-            int stage = (age - STEP) / (warning + 15);
-            int frame = (age - STEP) % (warning + 15);
+        private boolean dive(Fight fight, List<Player> players, double damage, double radius, int warning, Language language) {
+            EnderDragon dragon = fight.dragon;
+            int stage = diveStage;
+            int frame = age - diveStageStartedAt;
+            boolean ringImpact = regularStyle == RegularStyle.SOVEREIGN && dives > 1 && stage + 1 == dives;
+            double innerRadius = ringImpact ? radius * .45 : 0;
             if (frame == 0) {
-                diveTarget = stage == 0 ? aim : players.get(stage % players.size()).getLocation();
                 diveOrigin = dragon.getLocation().add(0, 2, 0);
+                if (stage == 0) {
+                    diveTarget = aim;
+                    if (regularStyle == RegularStyle.SOVEREIGN && dives > 1) {
+                        diveTargetsSeen = new HashSet<>();
+                        diveTargetsSeen.add(regularTarget);
+                    }
+                } else {
+                    Player target;
+                    if (diveTargetsSeen != null) {
+                        target = sovereignDiveTarget(players);
+                        if (target != null) diveTargetsSeen.add(target.getUniqueId());
+                    } else {
+                        var targets = players.stream()
+                            .filter(player -> inRange(diveOrigin, player.getEyeLocation(), RANGED_CAST_RANGE)
+                                && clearCastPath(diveOrigin, player.getEyeLocation(), RANGED_CAST_RANGE)).toList();
+                        target = targets.isEmpty() ? null : regularStyle.target(targets, diveOrigin, regularTarget);
+                    }
+                    if (target == null) return true;
+                    regularTarget = target.getUniqueId();
+                    diveTarget = target.getLocation();
+                    if (regularStyle == RegularStyle.STORM) diveTarget = stormDiveAim(diveOrigin, diveTarget, target);
+                    String cue = ringImpact ? "sovereign-ring-breath-strike-warning" : "breath-strike-stage-warning";
+                    target.sendActionBar(Component.text(language.text(cue)
+                        .replace("{stage}", Integer.toString(stage + 1)).replace("{total}", Integer.toString(dives)), NamedTextColor.GOLD));
+                }
+                flightControlled = true;
+                diveFlightDeadline = 0;
+                fight.requestPhase(EnderDragon.Phase.HOVER);
+                if (dragon.getPhase() == EnderDragon.Phase.HOVER) dragon.setVelocity(new Vector());
                 diveTarget.getWorld().playSound(diveTarget, Sound.ENTITY_ENDER_DRAGON_FLAP, 2, 0.8f);
             }
-            if (frame < warning) {
-                ring(diveTarget, radius, 22, WARNING);
-            } else if (frame < warning + 10) {
-                Location position = diveOrigin.clone().add(diveTarget.toVector().subtract(diveOrigin.toVector()).multiply((frame - warning + 5) / 15.0));
-                diveTarget.getWorld().spawnParticle(Particle.DRAGON_BREATH, position, 18, 0.65, 0.4, 0.65, 0.02, 1f);
-            } else {
-                ring(diveTarget, radius, 28, BEAM);
+            if (frame < warning && frame % 4 == 0) {
+                var audience = DragonParticles.warningViewers(diveTarget, 48);
+                warningRing(diveTarget, radius, 28, DIVE_WARNING, audience);
+                if (ringImpact) {
+                    warningRing(diveTarget, innerRadius, 24, SAFE, audience);
+                    for (int spoke = 0; spoke < 8; spoke++) {
+                        double angle = spoke * Math.TAU / 8;
+                        double middle = (innerRadius + radius) * .5;
+                        warningPoint(diveTarget, middle * Math.cos(angle), .15, middle * Math.sin(angle), DIVE_WARNING, audience);
+                    }
+                } else {
+                    warningPoint(diveTarget, 0, .45, 0, DIVE_WARNING, audience);
+                }
+            }
+            if (frame < warning) return false;
+            if (diveFlightDeadline == 0) {
+                Location destination = diveTarget.clone().add(0, 2, 0);
+                if (!clearCastPath(dragon.getLocation().add(0, 2, 0), destination, RANGED_CAST_RANGE)
+                    || !fight.maintainNativeCharge(destination)) return true;
+                nextDiveReaim = fight.age + NATIVE_CHARGE_REFRESH_TICKS;
+                diveFlightDeadline = fight.age + 80;
+                dragon.getWorld().playSound(dragon.getLocation(), Sound.ENTITY_ENDER_DRAGON_FLAP, 5, 1);
+                return false;
+            }
+            if (fight.age % 3 == STEP) {
+                Location body = dragon.getLocation().add(0, 1, 0);
+                body.getWorld().spawnParticle(Particle.DRAGON_BREATH, body, 6, .5, .45, .5, .02, 1f);
+            }
+            Location position = dragon.getLocation();
+            if (horizontalDistanceSquared(position, diveTarget) <= 36 && Math.abs(position.getY() - diveTarget.getY()) <= 7) {
+                if (diveStage + 1 >= dives) {
+                    fight.releaseCastFlight();
+                } else {
+                    fight.requestPhase(EnderDragon.Phase.HOVER);
+                    if (dragon.getVelocity().lengthSquared() > .01) dragon.setVelocity(new Vector());
+                }
+                var audience = DragonParticles.warningViewers(diveTarget, 48);
+                warningRing(diveTarget, radius, 32, DIVE_WARNING, audience);
+                if (ringImpact) warningRing(diveTarget, innerRadius, 24, SAFE, audience);
                 diveTarget.getWorld().playSound(diveTarget, Sound.ENTITY_GENERIC_EXPLODE, 1, 0.8f);
-                for (Player player : players) if (player.getLocation().distanceSquared(diveTarget) <= radius * radius) hurt(player, dragon, damage);
-                return stage + 1 >= dives;
+                for (Player player : players) {
+                    Location playerPosition = player.getLocation();
+                    if (inImpactArea(playerPosition, diveTarget, radius, 2)
+                        && horizontalDistanceSquared(playerPosition, diveTarget) >= innerRadius * innerRadius) {
+                        hurt(player, dragon, damage);
+                    }
+                }
+                diveStage++;
+                if (diveStage >= dives) return true;
+                diveStageStartedAt = age + 1;
+                diveFlightDeadline = 0;
+                return false;
+            }
+            if (fight.age >= diveFlightDeadline || (fight.age % 3 == STEP && SkyBite.hitFlightObstacle(dragon))) {
+                fight.releaseCastFlight();
+                return true;
+            }
+            if (fight.age >= nextDiveReaim) {
+                if (!fight.maintainNativeCharge(diveTarget.clone().add(0, 2, 0))) {
+                    fight.releaseCastFlight();
+                    return true;
+                }
+                nextDiveReaim = fight.age + NATIVE_CHARGE_REFRESH_TICKS;
             }
             return false;
+        }
+
+        private Player sovereignDiveTarget(List<Player> players) {
+            Player target = null;
+            int bestPriority = -1;
+            int matching = 0;
+            var random = ThreadLocalRandom.current();
+            for (Player player : players) {
+                UUID id = player.getUniqueId();
+                int priority = id.equals(regularTarget) ? 0 : diveTargetsSeen.contains(id) ? 1 : 2;
+                if (priority < bestPriority || !inRange(diveOrigin, player.getEyeLocation(), RANGED_CAST_RANGE)
+                    || !clearCastPath(diveOrigin, player.getEyeLocation(), RANGED_CAST_RANGE)) continue;
+                if (priority > bestPriority) {
+                    bestPriority = priority;
+                    matching = 0;
+                }
+                if (++matching == 1 || random.nextInt(matching) == 0) target = player;
+            }
+            return target;
         }
 
         private boolean finale(EnderDragon dragon, List<Player> players, double damage, double maxRadius, int warning) {
@@ -1520,64 +2159,144 @@ final class DragonSkills {
         private boolean shockwave(EnderDragon dragon, List<Player> players, double damage, double maxRadius, int warning) {
             if (age <= warning) {
                 if (age % 5 == STEP) {
-                    ring(aim, Math.min(2, maxRadius), 18, WARNING);
-                    ring(aim, maxRadius, 28, WARNING);
+                    var audience = DragonParticles.warningViewers(aim, 48);
+                    shockwaveRing(Math.min(2, maxRadius), 16, WARNING, audience);
+                    shockwaveRing(maxRadius, 36, WARNING, audience);
                 }
                 return false;
             }
             double radius = Math.min(maxRadius, (age - warning) * 0.4);
             if (age == warning + STEP) aim.getWorld().playSound(aim, Sound.ENTITY_GENERIC_EXPLODE, 0.9f, 0.7f);
-            if ((age - warning) % 3 == STEP || radius >= maxRadius) ring(aim, radius, 30, BEAM);
+            if ((age - warning) % 2 == STEP || radius >= maxRadius) {
+                shockwaveRing(radius, 36, BEAM, DragonParticles.warningViewers(aim, 48));
+            }
+            double inner = Math.max(0, radius - .8);
+            double outer = Math.min(maxRadius, radius + .4);
+            double innerSquared = inner * inner;
+            double outerSquared = outer * outer;
             for (Player player : players) {
                 Location position = player.getLocation();
-                double distance = Math.sqrt(horizontalDistanceSquared(position, aim));
-                if (Math.abs(position.getY() - aim.getY()) <= 1.5 && distance >= Math.max(0, radius - 2.6)
-                    && distance <= Math.min(maxRadius, radius + 0.6) && hit.add(player.getUniqueId())) hurt(player, dragon, damage);
+                if (Math.abs(position.getY() - aim.getY()) > 1.25) continue;
+                double distanceSquared = horizontalDistanceSquared(position, aim);
+                if (distanceSquared >= innerSquared && distanceSquared <= outerSquared
+                    && !inShockwaveGap(position.getX() - aim.getX(), position.getZ() - aim.getZ())
+                    && hit.add(player.getUniqueId())) hurt(player, dragon, damage);
             }
             return radius >= maxRadius;
         }
 
+        private boolean inShockwaveGap(double offsetX, double offsetZ) {
+            if (regularStyle != RegularStyle.SCOUT || offsetX * offsetX + offsetZ * offsetZ < .0001) return false;
+            double gapAngle = Math.atan2(origin.getZ() - aim.getZ(), origin.getX() - aim.getX());
+            return Math.cos(Math.atan2(offsetZ, offsetX) - gapAngle) >= .7071067811865476;
+        }
+
+        private void shockwaveRing(double radius, int points, Particle.DustOptions color, List<Player> audience) {
+            if (audience.isEmpty()) return;
+            if (regularStyle != RegularStyle.SCOUT) {
+                warningRing(aim, radius, points, color, audience);
+                return;
+            }
+            for (int point = 0; point < points; point++) {
+                double angle = Math.TAU * point / points;
+                double offsetX = Math.cos(angle), offsetZ = Math.sin(angle);
+                if (!inShockwaveGap(offsetX, offsetZ)) warningPoint(aim, radius * offsetX, .15, radius * offsetZ, color, audience);
+            }
+            double gapAngle = Math.atan2(origin.getZ() - aim.getZ(), origin.getX() - aim.getX());
+            for (int side = -1; side <= 1; side += 2) {
+                double edge = gapAngle + side * Math.PI / 4;
+                warningPoint(aim, radius * Math.cos(edge), .25, radius * Math.sin(edge), SAFE, audience);
+                warningPoint(aim, radius * Math.cos(edge), .55, radius * Math.sin(edge), SAFE, audience);
+            }
+        }
+
         private boolean fireball(EnderDragon dragon, List<Player> players, double damage, double radius, int warning) {
+            int travelTicks = 16;
+            if (age % 4 == STEP) {
+                var audience = DragonParticles.warningViewers(aim, 48);
+                warningRing(aim, radius, 28, FIREBALL_WARNING, audience);
+                double inner = Math.min(radius, .5);
+                warningRing(aim, inner + (radius - inner) * age / (warning + travelTicks), 12, FIREBALL_WARNING, audience);
+            }
             if (age <= warning) {
-                if (age % 5 == STEP) ring(aim, radius, 24, WARNING);
                 return false;
             }
-            if (age < warning + 25) {
-                double progress = (age - warning) / 25.0;
+            if (age < warning + travelTicks) {
+                double progress = (double) (age - warning) / travelTicks;
                 Vector route = aim.toVector().subtract(origin.toVector());
                 Location projectile = origin.clone().add(route.multiply(progress));
                 if (age % 2 == STEP) aim.getWorld().spawnParticle(Particle.DRAGON_BREATH, projectile, 12, .35, .35, .35, .025, 1f);
-                if (age % 5 == STEP) ring(aim, radius, 24, WARNING);
                 return false;
             }
-            aim.getWorld().spawnParticle(Particle.DRAGON_BREATH, aim, 100, 1.5, 0.7, 1.5, 0.04, 1f);
+            aim.getWorld().spawnParticle(Particle.DRAGON_BREATH, aim, 36, .9, .45, .9, .04, 1f);
+            warningRing(aim, radius, 28, FIREBALL_WARNING, DragonParticles.warningViewers(aim, 48));
             aim.getWorld().playSound(aim, Sound.ENTITY_GENERIC_EXPLODE, 1, 1.1f);
             for (Player player : players) {
-                if (player.getLocation().distanceSquared(aim) <= radius * radius) hurt(player, dragon, damage);
+                Location position = player.getLocation();
+                if (inImpactArea(position, aim, radius, 2.5)
+                    && clearCastPath(aim.clone().add(0, .35, 0), position.add(0, .8, 0), radius + 4)) hurt(player, dragon, damage);
             }
             return true;
         }
 
         private boolean laser(EnderDragon dragon, List<Player> players, double damage, double radius, int warning) {
+            boolean focus = regularStyle == RegularStyle.ABYSS;
+            int lastTrackTick = warning / 3;
+            boolean drawWarning = age % 4 == STEP;
+            if (focus && age <= lastTrackTick && (drawWarning || age == lastTrackTick)) {
+                for (Player player : players) {
+                    if (!player.getUniqueId().equals(regularTarget)) continue;
+                    Location body = player.getLocation().add(0, .9, 0);
+                    Vector direction = body.toVector().subtract(origin.toVector());
+                    if (direction.lengthSquared() > .01 && clearCastPath(origin, body, RANGED_CAST_RANGE)) {
+                        focusedAim = body.add(direction.normalize().multiply(4));
+                    }
+                    break;
+                }
+            }
+            boolean justLocked = focus && age == lastTrackTick + 1;
+            if (justLocked) {
+                origin.getWorld().playSound(origin, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, 2, 1.4f);
+            }
+            Location beamAim = focusedAim == null ? aim : focusedAim;
             if (age <= warning) {
-                if (age % 4 == STEP) line(origin, clip(origin, aim), 3, WARNING);
+                if (drawWarning || justLocked) {
+                    Location endpoint = clip(origin, beamAim);
+                    Vector segment = endpoint.toVector().subtract(origin.toVector());
+                    var audience = DragonParticles.warningViewers(origin.clone().add(segment.clone().multiply(.5)), 64);
+                    Particle.DustOptions color = focus && age > lastTrackTick ? LASER_LOCKED : LASER_WARNING;
+                    warningLine(origin, endpoint, 2, color, audience);
+                    Vector side = new Vector(-segment.getZ(), 0, segment.getX());
+                    if (side.lengthSquared() > .01) {
+                        side.normalize().multiply(radius);
+                        warningLine(origin.clone().add(side), endpoint.clone().add(side), 3.5, color, audience);
+                        warningLine(origin.clone().subtract(side), endpoint.clone().subtract(side), 3.5, color, audience);
+                    }
+                }
                 return false;
             }
-            Location endpoint = clip(origin, aim);
+            Location endpoint = clip(origin, beamAim);
             line(origin, endpoint, 0.65, BEAM);
             origin.getWorld().playSound(origin, Sound.BLOCK_BEACON_ACTIVATE, 1.5f, 0.6f);
             Vector segment = endpoint.toVector().subtract(origin.toVector());
             double lengthSquared = segment.lengthSquared();
             if (lengthSquared < 0.01) return true;
             for (Player player : players) {
-                Vector toPlayer = player.getLocation().add(0, 0.9, 0).toVector().subtract(origin.toVector());
+                Location body = player.getLocation().add(0, .9, 0);
+                Vector toPlayer = body.toVector().subtract(origin.toVector());
                 double projection = toPlayer.dot(segment) / lengthSquared;
                 if (projection >= 0 && projection <= 1
-                    && toPlayer.subtract(segment.clone().multiply(projection)).lengthSquared() <= radius * radius) {
+                    && toPlayer.subtract(segment.clone().multiply(projection)).lengthSquared() <= radius * radius
+                    && clearCastPath(origin, body, RANGED_CAST_RANGE + 5)) {
                     hurt(player, dragon, damage);
                 }
             }
             return true;
+        }
+
+        private static boolean inImpactArea(Location position, Location center, double radius, double height) {
+            return Math.abs(position.getY() - center.getY()) <= height
+                && horizontalDistanceSquared(position, center) <= radius * radius;
         }
     }
 }

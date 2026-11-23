@@ -13,7 +13,7 @@ ai:
 
 skills:
   enabled: true
-  interval-seconds: 14
+  interval-seconds: 9
   min-cast-gap-seconds: 6
   recovery-seconds: 2.5
   major-cooldown-seconds: 16
@@ -23,12 +23,15 @@ skills:
   shockwave:
     enabled: true
     damage: 5.0
+    radius: 12
   laser:
     enabled: false
   dive:
     enabled: true
     damage: 6.0
     combo-count: 2
+    radius: 4.5
+    warning-seconds: 1.25
   dragon-rush:
     enabled: false
   levitation-field:
@@ -38,7 +41,6 @@ skills:
     enabled: false
   crystal-burst:
     enabled: true
-    damage: 5.0
   sky-bite:
     enabled: false
   tracking-laser:
@@ -68,21 +70,21 @@ skills:
   thunder:
     enabled: true
     health-percent: 90
-    cooldown-seconds: 22
+    cooldown-seconds: 12
     warning-seconds: 1.25
     damage: 5.0
-    radius: 2.5
+    radius: 3.0
   thunderstorm:
     enabled: true
     health-percent: 45
-    cooldown-seconds: 42
+    cooldown-seconds: 26
     warning-seconds: 1.25
     damage: 3.0
-    radius: 2.1
+    radius: 2.75
   thunder-chain:
     enabled: true
     health-percent: 70
-    cooldown-seconds: 30
+    cooldown-seconds: 20
     warning-seconds: 2.5
     damage: 5.0
     radius: 8.0

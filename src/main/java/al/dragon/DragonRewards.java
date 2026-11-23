@@ -59,13 +59,15 @@ final class DragonRewards {
         BigDecimal sum = damage.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
         Policy policy = profile.rewards();
         int[] amounts = split(policy.total(), damage, sum);
+        int cap = plugin.smallPartyMoneyCap();
+        boolean capMoney = cap >= 0 && damage.stream().filter(value -> qualifies(value, sum)).limit(3).count() < 3;
         List<Hit> eligible = new ArrayList<>();
         for (int index = 0; index < ranking.size(); index++) {
             Hit hit = ranking.get(index);
             Player player = Bukkit.getPlayer(hit.id());
             if (policy.dice() && player != null && qualifies(damage.get(index), sum)
                 && plugin.rewardAvailable(new RewardLedger.Key(hit.id(), RewardLedger.Kind.DICE))) eligible.add(hit);
-            int amount = amounts[index];
+            int amount = capMoney ? Math.min(amounts[index], cap) : amounts[index];
             if (amount == 0) continue;
             var moneyKey = new RewardLedger.Key(hit.id(), RewardLedger.Kind.MONEY);
             if (!plugin.reserveReward(moneyKey)) continue;

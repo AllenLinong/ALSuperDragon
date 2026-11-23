@@ -1,16 +1,18 @@
 # Main configuration: language, summon chances and dragon egg chances.
 # All four summon chances must add up to 100. 0 disables random selection of that dragon.
 language: zh_CN
+random-summon:
+  scout-streak-limit: 2
 dragons:
   scout:
-    spawn-chance-percent: 55.0
+    spawn-chance-percent: 35.0
     egg-chance-percent: 8.0
   storm:
-    spawn-chance-percent: 30.0
+    spawn-chance-percent: 34.0
     egg-chance-percent: 18.0
   abyss:
-    spawn-chance-percent: 12.0
+    spawn-chance-percent: 23.0
     egg-chance-percent: 35.0
   sovereign:
-    spawn-chance-percent: 3.0
+    spawn-chance-percent: 8.0
     egg-chance-percent: 60.0

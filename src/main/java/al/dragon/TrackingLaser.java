@@ -16,6 +16,7 @@ final class TrackingLaser {
     private final Settings.TrackingBeam settings;
     private final double damage;
     private final ArrayDeque<Location> aimHistory = new ArrayDeque<>();
+    private final LaserGuard guard = new LaserGuard();
     private int age;
 
     TrackingLaser(EnderDragon dragon, Player target, Language language, Settings.TrackingBeam settings, double damageScale) {
@@ -48,28 +49,20 @@ final class TrackingLaser {
         double targetDistance = direction.length();
         if (targetDistance < .001) return frame >= settings.durationTicks();
         direction.multiply(1 / targetDistance);
-        double length = Math.min(targetDistance + 1.5, settings.range());
-        Location probe = origin.clone();
-        for (double distance = 0; distance < length;) {
-            double advance = Math.min(1, length - distance);
-            probe.add(direction.getX() * advance, direction.getY() * advance, direction.getZ() * advance);
-            if (!DragonParticles.loaded(probe)) {
-                length = distance;
-                break;
-            }
-            distance += advance;
-        }
+        double length = LaserGuard.loadedLength(origin, direction, Math.min(targetDistance + 1.5, settings.range()));
         if (length > .001) {
             var hit = origin.getWorld().rayTraceBlocks(origin, direction, length, FluidCollisionMode.NEVER, true);
             Location end = hit == null ? origin.clone().add(direction.clone().multiply(length)) : hit.getHitPosition().toLocation(origin.getWorld());
             double beamLength = origin.distance(end);
-            particles.trackingBeam(origin, direction, beamLength, end, hit != null);
-            if (frame % 10 == 0 && beamLength > .001) {
+            if (frame == 1 || frame % 4 == 0) particles.trackingBeam(origin, direction, beamLength, end, hit != null);
+            if (beamLength > .001 && (target.isBlocking() || frame % 10 == 0)) {
                 var contact = hitbox.rayTrace(start, direction, beamLength);
                 if (hitbox.contains(start) || (contact != null
                     && (hit == null || contact.getHitPosition().distanceSquared(start) < beamLength * beamLength))) {
-                    DragonSkills.hurt(target, dragon, damage);
-                    particles.laserEntityHit(target.getLocation());
+                    if (!guard.block(target, origin, frame) && frame % 10 == 0) {
+                        DragonSkills.hurt(target, dragon, damage);
+                        particles.laserEntityHit(target.getLocation());
+                    }
                 }
             }
         }

@@ -39,6 +39,7 @@ import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.ComplexEntityPart;
 import org.bukkit.entity.EnderDragon;
 import org.bukkit.entity.EnderCrystal;
+import org.bukkit.entity.DragonFireball;
 import org.bukkit.entity.Enderman;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
@@ -52,6 +53,7 @@ import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
+import org.bukkit.event.entity.EnderDragonChangePhaseEvent;
 import org.bukkit.event.entity.EntityRemoveEvent;
 import org.bukkit.event.world.EntitiesLoadEvent;
 import org.bukkit.event.world.WorldLoadEvent;
@@ -73,6 +75,7 @@ public final class ALDragon extends JavaPlugin implements Listener {
         "深渊龙", "abyss", "深渊", "abyss", "终末龙", "sovereign", "终末", "sovereign");
     private static final List<String> SUMMON_OPTIONS = List.of("random", "scout", "storm", "abyss", "sovereign", "随机", "巡界龙", "雷霆龙", "深渊龙", "终末龙");
     private final NamespacedKey profileKey = storedKey("dragon_profile");
+    private final NamespacedKey scoutStreakKey = storedKey("random_scout_streak");
     private final NamespacedKey damageKey = storedKey("damage_multiplier");
     private final NamespacedKey lastDamageKey = storedKey("last_damage_at");
     private final NamespacedKey idleDamageKey = storedKey("idle_reset_damage_at");
@@ -115,6 +118,9 @@ public final class ALDragon extends JavaPlugin implements Listener {
 
     @Override
     public void onEnable() {
+        if (Bukkit.getPluginManager().getPlugin("ALEnhancedEnderDragon") != null) {
+            getLogger().warning("Detected ALEnhancedEnderDragon. Both plugins can control the same dragon. Legacy Sky Bite can teleport the dragon and player, and legacy tracking lasers can fire away from the exit portal. Move the old plugin jar out of plugins and restart the server to use ALSuperDragon alone.");
+        }
         try {
             loadSettings();
             rewardLedger = new RewardLedger(getDataFolder().toPath().resolve("reward-counts.tsv"));
@@ -301,7 +307,8 @@ public final class ALDragon extends JavaPlugin implements Listener {
             if (encounter.idleDamageAt > 0) resetIdleEncounter(dragon, encounter, System.currentTimeMillis());
             updateHealthTitle(dragon, encounter);
             activeDragons.add(dragon.getUniqueId());
-            skills.tick(dragon, battle, encounter.profile.combat());
+            DragonParticles.tickBody(dragon, encounter.profile);
+            skills.tick(dragon, battle, encounter.profile);
         }
         skills.retain(activeDragons);
         skills.tickPodiumCrystals(activeDragons);
@@ -331,6 +338,10 @@ public final class ALDragon extends JavaPlugin implements Listener {
         if (battleTask == null) return;
         battleTask.cancel();
         battleTask = null;
+    }
+
+    int smallPartyMoneyCap() {
+        return rewardLimits.smallPartyMoneyCap();
     }
 
     boolean rewardAvailable(RewardLedger.Key key) {
@@ -425,7 +436,16 @@ public final class ALDragon extends JavaPlugin implements Listener {
         PendingSummon pending = pendingSummons.remove(world);
         DragonProfiles.Profile profile = profiles.get(data.get(profileKey, PersistentDataType.STRING));
         if (profile == null) {
-            profile = pending != null && pending.profile() != null ? pending.profile() : profiles.select(ThreadLocalRandom.current().nextDouble(100));
+            if (pending != null && pending.profile() != null) {
+                profile = pending.profile();
+            } else {
+                var worldData = dragon.getWorld().getPersistentDataContainer();
+                int scoutStreak = worldData.getOrDefault(scoutStreakKey, PersistentDataType.INTEGER, 0);
+                profile = profiles.select(ThreadLocalRandom.current().nextDouble(), scoutStreak);
+                int nextStreak = profiles.nextScoutStreak(profile.id(), scoutStreak);
+                if (nextStreak == 0) worldData.remove(scoutStreakKey);
+                else worldData.set(scoutStreakKey, PersistentDataType.INTEGER, nextStreak);
+            }
             AttributeInstance health = dragon.getAttribute(Attribute.MAX_HEALTH);
             if (health != null) {
                 double fraction = dragon.getHealth() / health.getValue();
@@ -458,7 +478,8 @@ public final class ALDragon extends JavaPlugin implements Listener {
         EnderDragon dragon = dragonSource(event.getDamageSource().getCausingEntity());
         if (dragon == null) dragon = dragonSource(event.getDamager());
         if (dragon == null) return;
-        if (DragonRushCast.isDecoy(dragon) || (event.getEntity() instanceof Enderman
+        if (DragonRushCast.isDecoy(dragon) || (skills.isChargeStunned(dragon) && isDragonContact(event, dragon))
+            || (event.getEntity() instanceof Enderman
             && (event.getDamager() instanceof EnderDragon || event.getDamager() instanceof ComplexEntityPart)
             && skills.isUsingSkyBite(dragon))) {
             event.setCancelled(true);
@@ -466,6 +487,34 @@ public final class ALDragon extends JavaPlugin implements Listener {
         }
         double multiplier = multiplier(dragon, damageKey);
         if (multiplier != 1) event.setDamage(event.getDamage() * multiplier);
+    }
+
+    private static boolean isDragonContact(EntityDamageByEntityEvent event, EnderDragon dragon) {
+        Entity direct = event.getDamageSource().getDirectEntity();
+        return (dragon.equals(direct) || (direct instanceof ComplexEntityPart part && dragon.equals(part.getParent())))
+            && event.getDamageSource().getDamageType().equals(org.bukkit.damage.DamageType.MOB_ATTACK);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onDragonPhaseChange(EnderDragonChangePhaseEvent event) {
+        if (!skills.allowsPhaseChange(event.getEntity(), event.getNewPhase())) event.setCancelled(true);
+    }
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onVanillaDragonFireball(com.destroystokyo.paper.event.entity.EnderDragonShootFireballEvent event) {
+        skills.replaceVanillaFireball(event);
+    }
+
+    @SuppressWarnings("deprecation")
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onChargeShieldBlock(EntityDamageByEntityEvent event) {
+        if (!(event.getEntity() instanceof Player player) || !player.isBlocking()
+            || player.getActiveItem().getType() != Material.SHIELD) return;
+        EnderDragon dragon = dragonSource(event.getDamageSource().getDirectEntity());
+        var blocking = EntityDamageEvent.DamageModifier.BLOCKING;
+        if (dragon != null && isDragonContact(event, dragon) && event.isApplicable(blocking) && event.getDamage(blocking) < 0) {
+            skills.blockAiCharge(dragon, DragonSkills.ChargeBlock.SHIELD);
+        }
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
@@ -553,6 +602,9 @@ public final class ALDragon extends JavaPlugin implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onDecoyExplosion(EntityExplodeEvent event) {
+        if (event.getEntity() instanceof EnderDragon dragon && !event.blockList().isEmpty()) {
+            skills.blockAiCharge(dragon, DragonSkills.ChargeBlock.WALL);
+        }
         if (isProtectedDragon(event.getEntity())) event.setCancelled(true);
     }
 

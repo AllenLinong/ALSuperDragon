@@ -3,3 +3,5 @@
 limits:
   money-max-times: 5
   dice-max-times: 3
+  # Per-clear, per-player coin cap with fewer than 3 contributors above 10% damage. -1 = no cap.
+  small-party-money-cap: 300

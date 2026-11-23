@@ -13,9 +13,10 @@ import org.bukkit.configuration.ConfigurationSection;
 final class RewardLedger {
     enum Kind { MONEY, DICE }
 
-    record Limits(int money, int dice) {
+    record Limits(int money, int dice, int smallPartyMoneyCap) {
         static Limits load(ConfigurationSection config) {
-            return new Limits(read(config, "money-max-times", 5), read(config, "dice-max-times", 3));
+            return new Limits(read(config, "money-max-times", 5), read(config, "dice-max-times", 3),
+                read(config, "small-party-money-cap", 300));
         }
 
         private static int read(ConfigurationSection config, String key, int fallback) {

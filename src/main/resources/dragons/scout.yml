@@ -13,7 +13,7 @@ ai:
 
 skills:
   enabled: true
-  interval-seconds: 17
+  interval-seconds: 11
   min-cast-gap-seconds: 7
   recovery-seconds: 2.5
   major-cooldown-seconds: 18
@@ -23,10 +23,12 @@ skills:
     damage: 4.0
     health-percent: 60
     warning-seconds: 2.0
+    radius: 3.5
   shockwave:
     enabled: true
     damage: 3.0
     warning-seconds: 2.0
+    radius: 10
   laser:
     enabled: false
   dive:
@@ -44,7 +46,9 @@ skills:
   tracking-laser:
     enabled: false
   ender-roar:
-    enabled: false
+    enabled: true
+    cooldown-seconds: 18
+    range: 100
   podium-crystal:
     enabled: false
   finale:

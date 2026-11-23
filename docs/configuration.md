@@ -1,6 +1,8 @@
 # 配置指南
 
-主配置 `config.yml` 只管 `language`（`zh_CN` / `en_US`）、四种龙各自的 `spawn-chance-percent` 和 `egg-chance-percent`。范围 `0–100`，四项召唤概率合计必须为 100。召唤概率为 0 只跳过随机，不限制管理员指定该龙。
+主配置 `config.yml` 包含语言、随机召唤和龙蛋掉率。四种龙的 `spawn-chance-percent` 和 `egg-chance-percent` 范围为 0–100，四项召唤概率合计必须为 100。召唤概率为 0 只跳过随机，不限制管理员指定该龙。新配置的基础召唤概率依次为巡界 35%、雷霆 34%、深渊 23%、终末 8%；旧配置的概率不自动覆盖。
+
+`random-summon.scout-streak-limit` 默认 2，旧配置没写也生效。同一末地连续两次随机抽中巡界龙后，下次按其余龙种的权重抽签。计数按世界保存，指定龙种不影响计数。设为 0 关闭保底；如果只有巡界龙权重非零，继续按原权重召唤。
 
 ## 单龙档案
 
@@ -10,22 +12,27 @@
 
 升级时，旧龙档案缺少的新技能段会在内存中按该龙的默认值补齐，不会改写文件。要调整伤害、预警、冷却或关闭新技能，从 `src/main/resources/dragons/` 下对应的模板复制技能段即可；显式设置 `enabled: false` 会保留。
 
-雷霆万钧的 `radius` 是每道雷的命中半径，不是轰炸范围。水晶复活的 `heal-per-second` 是复活水晶提供的额外回血，`cooldown-seconds` 用于限制没有空塔顶时的重试频率。
+雷霆万钧的 `radius` 是每道雷的命中半径，不是轰炸范围。每波优先在范围内一名玩家脚下标记一道雷，预警开始后不再追踪，单人每波最多被该技能命中一次。默认雷霆、雷霆万钧、雷链冷却分别为 12、26、20 秒；仍受全局起手间隔和其他技能影响。旧服的显式值不会覆盖，要使用新数值请按新模板更新 `dragons/storm.yml`（含雷霆和雷霆万钧的命中半径 3.0 和 2.75）。水晶复活的 `heal-per-second` 是复活水晶提供的额外回血，`cooldown-seconds` 用于限制没有空塔顶时的重试频率。
 
-雷霆龙默认开启蓝白电弧，替换普通尾迹；只向 64 格内玩家发送，不增加实体、不造成伤害。可用 `skills.electric-aura.enabled` 关闭，`skills.electric-aura.interval-ticks` 默认 5（范围 4–40）。
+四种龙的随身特效独立于战斗，只向 64 格内玩家发送，不增加实体、不造成伤害；创造和旁观模式也可见。雷霆龙默认用蓝白电弧替换尾迹，可用 `skills.electric-aura.enabled` 关闭，`skills.electric-aura.interval-ticks` 默认 5（范围 4–40）；其余尾迹由 `skills.trail.enabled` 控制。两个开关都关闭时不显示随身特效。
 
 雷霆龙的 `skills.entrance-storm.damage` 控制登场雷暴的基础伤害，默认 `3.0`（含默认龙种倍率为 3.75 点，减免前）。设为 `0` 或关闭 `skills.enabled` 则只保留登场特效。旧档案未写此项时使用默认值。
 
-`skills.min-cast-gap-seconds` 设置最短起手间隔；`skills.interval-seconds` 设置常规间隔；`skills.major-cooldown-seconds` 设置两个大招的最短起手间隔；`skills.recovery-seconds` / `skills.major-recovery-seconds` 控制结束后休整。雷链的 `radius` 是断链距离，开始连线距离为其 75%。
+`skills.min-cast-gap-seconds` 设置最短起手间隔；`skills.interval-seconds` 设置冲击波、俯冲、火球、激光等常规攻击的起手间隔，巡界龙、雷霆龙、深渊龙、终末龙默认分别为 11、9、8、7 秒。实际起手仍受目标距离、施法和休整限制。旧服已写入的间隔不会覆盖，要使用新数值请修改各龙配置并重载，对新初始化的龙生效。`skills.major-cooldown-seconds` 设置两个大招的最短起手间隔；`skills.recovery-seconds` / `skills.major-recovery-seconds` 控制结束后休整。雷链的 `radius` 是断链距离，开始连线距离为其 75%。
+
+环形扫射可重复施放，`skills.laser.sweep-cooldown-seconds` 默认 25 秒；追踪激光的 `skills.tracking-laser.cooldown-seconds` 默认 20 秒。旧档案显式设置的冷却不会被覆盖。
+
+巡界龙默认开启怒吼：血量首次降到 80%、60%、40%、20% 时各解锁一次，怒吼间隔至少 18 秒，仍受大招间隔影响。每次最多指挥附近 24 只现有末影人攻击场内的生存或冒险玩家，不会额外生成末影人。`skills.ender-roar.range` 默认 100 格，以龙为中心。旧服的 `dragons/scout.yml` 如果仍有 `skills.ender-roar.enabled: false`，请手动开启后执行 `/aldragon reload`，对新初始化的龙生效。
 
 ## 奖金与骰子
 
-全局次数上限在 `plugins/ALSuperDragon/rewards.yml`（首次加载新版本生成）：
+全局奖励上限在 `plugins/ALSuperDragon/rewards.yml`（文件不存在时自动生成）：
 
 ```yaml
 limits:
   money-max-times: 5
   dice-max-times: 3
+  small-party-money-cap: 300
 ```
 
 已有 `rewards.yml` 的显式值不会被覆盖；若旧服仍设为 `1`，请手动改为 `3` 并执行 `/aldragon reload`。
@@ -33,6 +40,8 @@ limits:
 金币领取和骰子中奖按玩家 UUID 分开累计，四条龙和所有末地世界共用额度，不按天重置。`-1` 不限次数，`0` 禁止领取；修改后执行 `/aldragon reload`。已累计的次数不会因重载或正常重启而清零，升级前的奖励不追溯。奖励历史保存在 `reward-counts.tsv`，计数根据奖励指令是否被服务器接受，无法确认第三方经济插件实际到账。
 
 金币达到上限的玩家不领取自己原本的份额，该份额不转发；骰子次数用完的玩家不进入抽奖，未中奖不扣次数。一次中奖无论执行几条奖品指令都最多计一次；所有指令均未被接受则不计。如果停服时仍有奖励等待派发，请先等发奖完成。
+
+如果本场对龙造成的有效伤害占比严格超过 10% 的玩家不足三人，则按原伤害比例分配后，每人每场最多领 300 金币（多余部分不转发）。人数按伤害记录计算，旁观或轻打几下不能解除上限。旧配置缺少 `limits.small-party-money-cap` 时也默认 300；设为 `-1` 取消此金额上限，设为 `0` 则不发小队金币。骰子与领取次数规则不变。
 
 每条龙的奖励金额和实物命令仍在各自的 `dragons/<龙种>.yml`：
 
